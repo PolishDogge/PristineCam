@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PristineCam</string>
+    <string name="notif_channel_name">Camera Stream</string>
+    <string name="notif_streaming">PristineCam is streaming</string>
+    <string name="notif_title">PristineCam — Streaming</string>
+    <string name="action_stop">Stop</string>
+</resources>
