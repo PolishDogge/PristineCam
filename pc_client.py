@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 from typing import Optional
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -245,6 +246,30 @@ def stream(url: str, target_fps: int, width: int, height: int) -> None:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+def normalize_url(url: str) -> str:
+    """
+    Auto-fills missing parts of the URL.
+    - Prepends http:// if scheme is missing.
+    - Appends :8080 if port is missing.
+    - Appends /video_feed if path is missing.
+    """
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+        
+    parsed = urlparse(url)
+    netloc = parsed.netloc
+    path = parsed.path
+    
+    if parsed.port is None:
+        netloc = f"{netloc}:8080"
+        
+    if not path or path == "/":
+        path = "/video_feed"
+        
+    query = f"?{parsed.query}" if parsed.query else ""
+    return f"{parsed.scheme}://{netloc}{path}{query}"
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Forward an MJPEG stream from an Android device to a virtual webcam.",
@@ -278,12 +303,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _build_parser().parse_args()
+    url = normalize_url(args.url)
     log.info(
         "Starting PC client  url=%s  fps=%d  preferred=%dx%d",
-        args.url, args.fps, args.width, args.height,
+        url, args.fps, args.width, args.height,
     )
     stream(
-        url=args.url,
+        url=url,
         target_fps=args.fps,
         width=args.width,
         height=args.height,

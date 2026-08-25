@@ -2,7 +2,6 @@ package com.pristinecam
 
 import android.Manifest
 import android.content.ComponentName
-import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
@@ -70,10 +69,6 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Keep the screen on while the app is in the foreground.
-        // This prevents the device from locking the screen during streaming.
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-
         enableEdgeToEdge()
         checkAndRequestPermission()
         setContent {
@@ -123,7 +118,7 @@ class MainActivity : ComponentActivity() {
         // then bind to obtain a reference to the service object.
         val intent = Intent(this, StreamingService::class.java)
         ContextCompat.startForegroundService(this, intent)
-        bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+        bindService(intent, serviceConnection, BIND_AUTO_CREATE)
     }
 }
 
@@ -148,6 +143,29 @@ private fun MainScreen(service: StreamingService) {
     }
     DisposableEffect(Unit) {
         onDispose { service.attachPreview(null) }
+    }
+
+    // Manage screen wake / brightness based on streaming state.
+    // • Streaming  → keep screen on but dim it (saves battery, stream continues).
+    // • Idle       → restore normal brightness and allow the OS to lock the screen.
+    val window = (context as? ComponentActivity)?.window
+    SideEffect {
+        window?.let { w ->
+            if (isStreaming) {
+                // Keep screen alive so the camera service isn't throttled by Doze,
+                // but dim the display to save battery.
+                w.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                w.attributes = w.attributes.apply {
+                    screenBrightness = 0.01f
+                }
+            } else {
+                // Let Android's normal timeout and lock apply.
+                w.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                w.attributes = w.attributes.apply {
+                    screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+                }
+            }
+        }
     }
 
     val btnColor by animateColorAsState(

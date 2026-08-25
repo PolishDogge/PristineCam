@@ -46,7 +46,7 @@ try:
     )
     from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPixmap
     from PyQt6.QtWidgets import (
-        QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout,
+        QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame, QHBoxLayout,
         QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
         QSizePolicy, QSlider, QStatusBar, QVBoxLayout, QWidget,
     )
@@ -72,31 +72,50 @@ PREVIEW_FPS        = 30
 PREVIEW_EVERY_N    = TARGET_FPS // PREVIEW_FPS  # emit preview every 3rd frame
 PREVIEW_W, PREVIEW_H = 480, 270                # preview downscale resolution
 
+TIMEOUT_THREAD_JOIN = 3000       # ms
+TIMEOUT_CAP_JOIN    = 3.0        # seconds
+MAX_EMPTY_STREAK    = 45         # frames
+FPS_WINDOW_SIZE     = 60         # frames for moving average
+LATENCY_GOOD_MS     = 80
+LATENCY_WARN_MS     = 250
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
-CONFIG_FILE = Path(__file__).parent / "pristinecam_settings.json"
+if getattr(sys, 'frozen', False):
+    # Running as compiled PyInstaller executable
+    _base_dir = Path(sys.executable).parent
+else:
+    # Running as a script
+    _base_dir = Path(__file__).parent
 
+CONFIG_FILE = _base_dir / "pristinecam_settings.json"
 _DEFAULTS: dict = {
-    "ip":           "192.168.1.100",
-    "port":         8080,
-    "usb_mode":     False,
-    "mirror_h":     False,
-    "mirror_v":     False,
+    "ip": "192.168.1.100",
+    "port": 8080,
+    "usb_mode": False,
+    "mirror_h": False,
+    "mirror_v": False,
     "rotation_idx": 0,
-    "backend_idx":  0,
+    "backend_idx": 0,
     "show_preview": True,
+    "preview_fps": 30,
+    "preview_res": "480x270",
+    "show_stats": False,
 }
 
-
 def _load_cfg() -> dict:
+    cfg = _DEFAULTS.copy()
     if CONFIG_FILE.exists():
         try:
-            return {**_DEFAULTS, **json.loads(CONFIG_FILE.read_text())}
+            loaded = json.loads(CONFIG_FILE.read_text())
+            for k, v in _DEFAULTS.items():
+                if k in loaded and isinstance(loaded[k], type(v)):
+                    cfg[k] = loaded[k]
         except Exception:
             pass
-    return _DEFAULTS.copy()
+    return cfg
 
 
 def _save_cfg(cfg: dict) -> None:
@@ -131,6 +150,16 @@ def _adb_forward(port: int) -> tuple[bool, str]:
     except Exception as exc:
         return False, str(exc)
 
+def _adb_remove_forward(port: int) -> None:
+    """Run `adb forward --remove tcp:<port>` to cleanup."""
+    try:
+        subprocess.run(
+            ["adb", "forward", "--remove", f"tcp:{port}"],
+            capture_output=True, timeout=2,
+        )
+    except Exception:
+        pass
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Virtual-camera backend table
@@ -146,11 +175,11 @@ _BACKENDS: dict[str, Optional[str]] = {
 _ROT_ANGLES = [0, 90, 180, 270]
 
 _STATUS_STYLE: dict[str, tuple[str, str]] = {
-    "connecting":   ("Connecting…",    "#fcc419"),
-    "connected":    ("Connected",      "#40c057"),
-    "reconnecting": ("Reconnecting…",  "#fd7e14"),
-    "error":        ("Connection error", "#fa5252"),
-    "disconnected": ("Disconnected",   "#5c6370"),
+    "connecting":   ("Connecting…",    "#eab308"),
+    "connected":    ("Connected",      "#10b981"),
+    "reconnecting": ("Reconnecting…",  "#f97316"),
+    "error":        ("Connection error", "#ef4444"),
+    "disconnected": ("Disconnected",   "#71717a"),
 }
 
 
@@ -196,6 +225,17 @@ class StreamWorker(QObject):
         self.mirror_v: bool     = False
         self.rotation: int      = 0
         self.show_preview: bool = True
+        self.preview_fps: int   = 10
+        self.preview_w: int     = 480
+        self.preview_h: int     = 270
+        
+        self._backend: Optional[str] = backend
+        self._force_vcam_recreate: bool = False
+
+    def set_backend(self, backend: Optional[str]) -> None:
+        if self._backend != backend:
+            self._backend = backend
+            self._force_vcam_recreate = True
 
     def stop(self) -> None:
         self._running = False
@@ -234,7 +274,7 @@ class StreamWorker(QObject):
 
             if not ok or frame is None:
                 empty_streak += 1
-                if empty_streak >= 45:
+                if empty_streak >= MAX_EMPTY_STREAK:
                     cap.release()
                     cap = None
                     self.status_changed.emit("reconnecting")
@@ -256,7 +296,7 @@ class StreamWorker(QObject):
 
         cam                       = None
         cam_dims: tuple[int, int] = (0, 0)
-        frame_times: deque[float] = deque(maxlen=60)
+        frame_times: deque[float] = deque(maxlen=FPS_WINDOW_SIZE)
         frame_count               = 0
 
         cap_thread = threading.Thread(
@@ -298,7 +338,8 @@ class StreamWorker(QObject):
                 # ── Virtual camera (always on) ────────────────────────
                 if HAS_VCAM:
                     oh, ow = out.shape[:2]
-                    if cam is None or cam_dims != (ow, oh):
+                    if cam is None or cam_dims != (ow, oh) or self._force_vcam_recreate:
+                        self._force_vcam_recreate = False
                         _vcam_close(cam)
                         cam = None
                         try:
@@ -312,8 +353,18 @@ class StreamWorker(QObject):
                             cam = pyvirtualcam.Camera(**kw)
                             cam_dims = (ow, oh)
                         except Exception as exc:
-                            self.error_occurred.emit(f"Virtual cam: {exc}")
-                            cam = None
+                            if self._backend:
+                                self.error_occurred.emit(f"VCam backend '{self._backend}' failed: {exc}. Falling back...")
+                                try:
+                                    del kw["backend"]
+                                    cam = pyvirtualcam.Camera(**kw)
+                                    cam_dims = (ow, oh)
+                                except Exception as exc2:
+                                    self.error_occurred.emit(f"Virtual cam failed: {exc2}")
+                                    cam = None
+                            else:
+                                self.error_occurred.emit(f"Virtual cam failed: {exc}")
+                                cam = None
 
                     if cam:
                         try:
@@ -323,34 +374,46 @@ class StreamWorker(QObject):
                             cam = None
                             cam_dims = (0, 0)
 
-                # ── Preview (10 FPS, downscaled, skippable) ───────────
+                # ── Preview (dynamic FPS, dynamic res) ───────────
                 frame_count += 1
-                if self.show_preview and frame_count % PREVIEW_EVERY_N == 0:
-                    small = cv2.resize(
-                        out, (PREVIEW_W, PREVIEW_H),
-                        interpolation=cv2.INTER_NEAREST,
-                    )
-                    rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-                    qimg = QImage(
-                        rgb.data,
-                        PREVIEW_W, PREVIEW_H,
-                        rgb.strides[0],
-                        QImage.Format.Format_RGB888,
-                    ).copy()
-                    self.frame_ready.emit(qimg)
+                if self.show_preview:
+                    preview_every_n = max(1, TARGET_FPS // self.preview_fps) if self.preview_fps > 0 else 1
+                    if frame_count % preview_every_n == 0:
+                        if self.preview_w > 0 and self.preview_h > 0:
+                            small = cv2.resize(
+                                out, (self.preview_w, self.preview_h),
+                                interpolation=cv2.INTER_NEAREST,
+                            )
+                        else:
+                            small = out
+                            
+                        ph, pw = small.shape[:2]
+                        qimg = QImage(
+                            small.data,
+                            pw, ph,
+                            small.strides[0],
+                            QImage.Format.Format_BGR888,
+                        ).copy()
+                        self.frame_ready.emit(qimg)
 
                 # ── Pace to 30 FPS ────────────────────────────────────
-                elapsed = time.perf_counter() - t_loop
-                sleep_for = FRAME_INTERVAL - elapsed
-                if sleep_for > 0:
-                    time.sleep(sleep_for)
+                if cam is not None and hasattr(cam, "sleep_until_next_frame"):
+                    try:
+                        cam.sleep_until_next_frame()
+                    except Exception:
+                        pass
+                else:
+                    elapsed = time.perf_counter() - t_loop
+                    sleep_for = FRAME_INTERVAL - elapsed
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
 
         except Exception as exc:
             self.error_occurred.emit(str(exc))
         finally:
             self._running = False
             self._frame_event.set()  # unblock capture if it's setting
-            cap_thread.join(timeout=3.0)
+            cap_thread.join(timeout=TIMEOUT_CAP_JOIN)
             _vcam_close(cam)
             self.status_changed.emit("disconnected")
 
@@ -429,36 +492,29 @@ class PreviewWidget(QWidget):
         p.end()
 
     def _draw_placeholder(self, p: QPainter) -> None:
-        cx, cy = self.width() // 2, self.height() // 2
-
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor("#17191f"))
-        p.drawRoundedRect(cx - 36, cy - 26, 72, 52, 8, 8)
-
-        p.setBrush(QColor("#1e2028"))
-        p.drawEllipse(cx - 14, cy - 14, 28, 28)
-        p.setBrush(QColor("#17191f"))
-        p.drawEllipse(cx - 9, cy - 9, 18, 18)
-
+        p.setBrush(QColor("#09090b"))
+        p.drawRect(self.rect())
+        
         f1 = QFont()
-        f1.setPointSize(11)
+        f1.setPointSize(14)
         f1.setWeight(QFont.Weight.DemiBold)
         p.setFont(f1)
-        p.setPen(QColor("#3a3f4d"))
+        p.setPen(QColor("#71717a"))
         p.drawText(
-            self.rect().adjusted(0, cy // 2 + 14, 0, 0),
-            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
-            "NO SIGNAL",
+            self.rect(),
+            Qt.AlignmentFlag.AlignCenter,
+            "NO SIGNAL"
         )
-
+        
         f2 = QFont()
-        f2.setPointSize(9)
+        f2.setPointSize(10)
         p.setFont(f2)
-        p.setPen(QColor("#272b36"))
+        p.setPen(QColor("#52525b"))
         p.drawText(
-            self.rect().adjusted(0, cy // 2 + 36, 0, 0),
-            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
-            "Open PristineCam on your phone, then tap Connect",
+            self.rect().adjusted(0, 40, 0, 0),
+            Qt.AlignmentFlag.AlignCenter,
+            "Open PristineCam on your phone, then tap Connect"
         )
 
 
@@ -478,8 +534,8 @@ class _SectionLabel(QLabel):
     def __init__(self, text: str) -> None:
         super().__init__(text.upper())
         self.setStyleSheet(
-            "color:#444b5c; font-size:10px; font-weight:700;"
-            "letter-spacing:1.3px; padding:4px 0 2px 0;"
+            "color:#71717a; font-size:11px; font-weight:700;"
+            "letter-spacing:1px; background:transparent; padding-top:8px;"
         )
 
 
@@ -489,25 +545,96 @@ class _StatRow(QWidget):
     def __init__(self, key: str, value: str = "—") -> None:
         super().__init__()
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 2, 0, 2)
-        lay.setSpacing(6)
+        lay.setContentsMargins(0, 4, 0, 4)
+        lay.setSpacing(12)
 
         self._key_lbl = QLabel(key)
         self._key_lbl.setFixedWidth(82)
-        self._key_lbl.setStyleSheet("color:#444b5c; font-size:12px;")
+        self._key_lbl.setStyleSheet("color:#a1a1aa; font-size:12px; background:transparent;")
 
         self._val_lbl = QLabel(value)
-        self._val_lbl.setStyleSheet("color:#a8adb8; font-size:12px;")
+        self._val_lbl.setStyleSheet("color:#f4f4f5; font-size:12px; font-family:'Consolas', 'JetBrains Mono', monospace; font-weight:500; background:transparent;")
 
         lay.addWidget(self._key_lbl)
         lay.addWidget(self._val_lbl)
         lay.addStretch()
 
-    def set_text(self, text: str, color: str = "#a8adb8") -> None:
+    def set_text(self, text: str, color: str = "#f4f4f5") -> None:
         self._val_lbl.setText(text)
         self._val_lbl.setStyleSheet(
-            f"color:{color}; font-size:12px; font-weight:500;"
+            f"color:{color}; font-size:12px; font-family:'Consolas', 'JetBrains Mono', monospace; font-weight:500; background:transparent;"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Settings Dialog
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SettingsDialog(QDialog):
+    def __init__(self, cfg: dict, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.cfg = cfg
+        self.setWindowTitle("Settings")
+        self.setModal(True)
+        self.setMinimumWidth(380)
+        
+        lay = QVBoxLayout(self)
+        
+        form = QFormLayout()
+        
+        # Preview FPS
+        self.fps_cb = QComboBox()
+        self.fps_cb.addItems(["5 FPS", "10 FPS", "15 FPS", "30 FPS (Match stream)"])
+        self.fps_cb.setToolTip("Lower FPS reduces CPU usage.")
+        form.addRow("Preview FPS:", self.fps_cb)
+        
+        # Preview Resolution
+        self.res_cb = QComboBox()
+        self.res_cb.addItems(["480×270", "640×360", "960×540", "Native / Source"])
+        self.res_cb.setToolTip("Lower resolution increases performance.")
+        form.addRow("Preview Res:", self.res_cb)
+        
+        # Virtual Camera Backend
+        self.backend_cb = QComboBox()
+        for label in _BACKENDS:
+            self.backend_cb.addItem(label)
+        self.backend_cb.setToolTip("Select virtual camera backend driver.")
+        form.addRow("VCam Backend:", self.backend_cb)
+        
+        # Show Stats
+        self.stats_chk = QCheckBox("Show Performance Stats")
+        self.stats_chk.setToolTip("Toggle visibility of FPS, Latency, and Resolution.")
+        form.addRow("", self.stats_chk)
+        
+        lay.addLayout(form)
+        
+        bbox = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bbox.accepted.connect(self.accept)
+        bbox.rejected.connect(self.reject)
+        lay.addWidget(bbox)
+        
+        # Load values
+        fps = cfg.get("preview_fps", 30)
+        idx = {5: 0, 10: 1, 15: 2, 30: 3}.get(fps, 3)
+        self.fps_cb.setCurrentIndex(idx)
+        
+        res = cfg.get("preview_res", "480x270")
+        idx = {"480x270": 0, "640x360": 1, "960x540": 2}.get(res, 3)
+        self.res_cb.setCurrentIndex(idx)
+        
+        self.backend_cb.setCurrentIndex(cfg.get("backend_idx", 0))
+        self.stats_chk.setChecked(cfg.get("show_stats", False))
+        
+    def accept(self):
+        fps_val = [5, 10, 15, 30][self.fps_cb.currentIndex()]
+        self.cfg["preview_fps"] = fps_val
+        
+        res_val = ["480x270", "640x360", "960x540", "Native"][self.res_cb.currentIndex()]
+        self.cfg["preview_res"] = res_val
+        
+        self.cfg["backend_idx"] = self.backend_cb.currentIndex()
+        self.cfg["show_stats"] = self.stats_chk.isChecked()
+        super().accept()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -531,8 +658,8 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         self.setWindowTitle("PristineCam")
-        self.setMinimumSize(900, 600)
-        self.resize(1280, 720)
+        self.setMinimumSize(945, 630)
+        self.resize(1344, 756)
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -568,44 +695,39 @@ class MainWindow(QMainWindow):
         # ── Right: controls ──────────────────────────────────────────────
         right = QWidget()
         right.setObjectName("CtrlPanel")
-        right.setFixedWidth(284)
+        right.setFixedWidth(280)
         right_lay = QVBoxLayout(right)
-        right_lay.setContentsMargins(14, 18, 16, 14)
+        right_lay.setContentsMargins(20, 24, 20, 24)
         right_lay.setSpacing(12)
 
         # ··· Connection ·················································
         right_lay.addWidget(_SectionLabel("Connection"))
-
+        
+        ip_port_lay = QHBoxLayout()
+        ip_port_lay.setContentsMargins(0, 0, 0, 0)
+        ip_port_lay.setSpacing(8)
         self._ip = QLineEdit()
         self._ip.setPlaceholderText("192.168.1.100")
         self._ip.setToolTip("Local IP address of the Android device on Wi-Fi")
-        self._mkrow(right_lay, "Phone IP", self._ip)
-
+        ip_port_lay.addWidget(self._ip, stretch=3)
         self._port = QLineEdit()
         self._port.setPlaceholderText("8080")
-        self._port.setMaximumWidth(72)
-        self._mkrow(right_lay, "Port", self._port)
+        self._port.setMaximumWidth(60)
+        ip_port_lay.addWidget(self._port, stretch=1)
+        right_lay.addLayout(ip_port_lay)
 
-        self._usb = QCheckBox("USB Mode  (ADB port-forward)")
-        self._usb.setToolTip(
-            "Automatically runs:\n"
-            "    adb forward tcp:8080 tcp:8080\n\n"
-            "Requirements:\n"
-            "  • USB cable between phone and PC\n"
-            "  • ADB (Android platform-tools) installed and in PATH\n\n"
-            "Benefit: lower latency than Wi-Fi; no network setup needed.\n"
-            "The IP field is ignored in this mode."
-        )
+        self._usb = QCheckBox("USB Mode (ADB port-forward)")
+        self._usb.setToolTip("Use ADB over USB instead of Wi-Fi for lower latency.")
         self._usb.toggled.connect(self._on_usb_toggled)
         right_lay.addWidget(self._usb)
 
-        self._conn_btn = QPushButton("▶   Connect")
+        self._conn_btn = QPushButton("Connect")
         self._conn_btn.setObjectName("ConnBtn")
         self._conn_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._conn_btn.clicked.connect(self._toggle_connection)
         right_lay.addWidget(self._conn_btn)
-
-        right_lay.addWidget(_Div())
+        
+        right_lay.addSpacing(12)
 
         # ··· Status ·····················································
         right_lay.addWidget(_SectionLabel("Status"))
@@ -615,82 +737,64 @@ class MainWindow(QMainWindow):
         self._s_res   = _StatRow("Resolution", "—")
         for w in (self._s_state, self._s_fps, self._s_lat, self._s_res):
             right_lay.addWidget(w)
-
-
-        right_lay.addWidget(_Div())
+            
+        right_lay.addSpacing(12)
 
         # ··· Transform ··················································
         right_lay.addWidget(_SectionLabel("Transform"))
-
-        mir = QWidget()
-        mir_lay = QHBoxLayout(mir)
+        
+        mir_lay = QHBoxLayout()
         mir_lay.setContentsMargins(0, 0, 0, 0)
-        mir_lay.setSpacing(6)
-        self._flip_h = QPushButton("↔  Mirror H")
+        mir_lay.setSpacing(8)
+        self._flip_h = QPushButton("Mirror H")
         self._flip_h.setCheckable(True)
-        self._flip_h.setToolTip("Flip frame horizontally (mirror mode)")
         self._flip_h.setCursor(Qt.CursorShape.PointingHandCursor)
         self._flip_h.toggled.connect(self._on_flip_h)
-        self._flip_v = QPushButton("↕  Mirror V")
+        self._flip_v = QPushButton("Mirror V")
         self._flip_v.setCheckable(True)
-        self._flip_v.setToolTip("Flip frame vertically")
         self._flip_v.setCursor(Qt.CursorShape.PointingHandCursor)
         self._flip_v.toggled.connect(self._on_flip_v)
         mir_lay.addWidget(self._flip_h)
         mir_lay.addWidget(self._flip_v)
-        right_lay.addWidget(mir)
+        right_lay.addLayout(mir_lay)
 
+        rot_lay = QHBoxLayout()
+        rot_lay.setContentsMargins(0, 0, 0, 0)
+        rot_lay.setSpacing(8)
+        rot_lbl = QLabel("Rotate")
+        rot_lbl.setStyleSheet("color:#a1a1aa; font-size:13px;")
+        rot_lay.addWidget(rot_lbl)
         self._rot = QComboBox()
-        self._rot.addItems([
-            "0°  (no rotation)",
-            "90°  (clockwise)",
-            "180°",
-            "270°  (counter-clockwise)",
-        ])
+        self._rot.addItems(["0°", "90°", "180°", "270°"])
         self._rot.currentIndexChanged.connect(self._on_rotation)
-        self._mkrow(right_lay, "Rotate", self._rot)
+        rot_lay.addWidget(self._rot, stretch=1)
+        right_lay.addLayout(rot_lay)
 
-        right_lay.addWidget(_Div())
+        right_lay.addSpacing(12)
 
         # ··· Display & Output ·············································
         right_lay.addWidget(_SectionLabel("Output"))
-
+        
         self._preview_chk = QCheckBox("Show Preview")
         self._preview_chk.setChecked(True)
-        self._preview_chk.setToolTip(
-            "Toggle the live preview in the main panel.\n"
-            "Disabling saves ~5-10% CPU by skipping resize and render."
-        )
         self._preview_chk.toggled.connect(self._on_preview_toggled)
         right_lay.addWidget(self._preview_chk)
 
-        self._backend = QComboBox()
-        for label in _BACKENDS:
-            self._backend.addItem(label)
-        self._backend.setToolTip(
-            "Auto-detect: pyvirtualcam picks the available driver.\n"
-            "OBS: requires OBS Studio (Windows / macOS).\n"
-            "v4l2loopback: Linux kernel module.\n"
-            "Unity Capture: Windows-only alternative driver."
-        )
-        self._mkrow(right_lay, "Backend", self._backend)
+        self._settings_btn = QPushButton("Settings")
+        self._settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._settings_btn.clicked.connect(self._open_settings)
+        right_lay.addWidget(self._settings_btn)
 
         if not HAS_VCAM:
-            vcam_warn = QLabel("⚠  pyvirtualcam not installed")
-            vcam_warn.setStyleSheet("color:#fa5252; font-size:11px; padding:2px 0;")
-            vcam_warn.setToolTip(
-                "pip install pyvirtualcam\n\n"
-                "Also install the driver for your OS:\n"
-                "  Windows/macOS → OBS Studio (or Unity Capture)\n"
-                "  Linux → sudo modprobe v4l2loopback"
-            )
+            vcam_warn = QLabel("⚠ pyvirtualcam not installed")
+            vcam_warn.setStyleSheet("color:#ef4444; font-size:12px; padding:2px 0;")
             right_lay.addWidget(vcam_warn)
 
         right_lay.addStretch()
 
-        footer = QLabel("No telemetry  ·  Local only  ·  Open source")
+        footer = QLabel("No telemetry · Local only · Open source")
         footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        footer.setStyleSheet("color:#262a36; font-size:10px; padding-top:4px;")
+        footer.setStyleSheet("color:#52525b; font-size:11px; padding-top:4px;")
         right_lay.addWidget(footer)
 
         root_lay.addWidget(left, stretch=1)
@@ -698,23 +802,7 @@ class MainWindow(QMainWindow):
 
         # Status bar
         sb = QStatusBar()
-        sb.setStyleSheet("background:#10111a; color:#444b5c; font-size:11px;")
         self.setStatusBar(sb)
-
-    # ── Helper: labelled row ─────────────────────────────────────────────
-
-    @staticmethod
-    def _mkrow(parent: QVBoxLayout, label: str, widget: QWidget) -> None:
-        row = QWidget()
-        lay = QHBoxLayout(row)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(8)
-        lbl = QLabel(label)
-        lbl.setFixedWidth(70)
-        lbl.setStyleSheet("color:#444b5c; font-size:12px;")
-        lay.addWidget(lbl)
-        lay.addWidget(widget)
-        parent.addWidget(row)
 
     # ── Settings persistence ─────────────────────────────────────────────
 
@@ -726,21 +814,61 @@ class MainWindow(QMainWindow):
         self._flip_h.setChecked(c.get("mirror_h", False))
         self._flip_v.setChecked(c.get("mirror_v", False))
         self._rot.setCurrentIndex(c.get("rotation_idx", 0))
-        self._backend.setCurrentIndex(c.get("backend_idx", 0))
         self._preview_chk.setChecked(c.get("show_preview", True))
+        self._apply_stats_visibility()
 
     def _persist_settings(self) -> None:
+        try:
+            port_val = int(self._port.text().strip() or "8080")
+        except ValueError:
+            port_val = 8080
+
         self._cfg.update({
             "ip":           self._ip.text().strip(),
-            "port":         self._port.text().strip(),
+            "port":         port_val,
             "usb_mode":     self._usb.isChecked(),
             "mirror_h":     self._flip_h.isChecked(),
             "mirror_v":     self._flip_v.isChecked(),
             "rotation_idx": self._rot.currentIndex(),
-            "backend_idx":  self._backend.currentIndex(),
             "show_preview": self._preview_chk.isChecked(),
         })
         _save_cfg(self._cfg)
+
+    def _open_settings(self) -> None:
+        dlg = SettingsDialog(self._cfg, self)
+        if dlg.exec():
+            self._persist_settings()
+            self._apply_settings_to_worker()
+            self._apply_stats_visibility()
+
+    def _apply_settings_to_worker(self) -> None:
+        if not self._worker:
+            return
+            
+        fps = self._cfg.get("preview_fps", 30)
+        self._worker.preview_fps = fps
+        
+        res = self._cfg.get("preview_res", "480x270")
+        if res == "Native":
+            w, h = 0, 0
+        else:
+            try:
+                w, h = map(int, res.split("x"))
+            except ValueError:
+                w, h = 480, 270
+        self._worker.preview_w = w
+        self._worker.preview_h = h
+        
+        b_idx = self._cfg.get("backend_idx", 0)
+        b_keys = list(_BACKENDS.keys())
+        if b_idx < len(b_keys):
+            self._worker.set_backend(_BACKENDS[b_keys[b_idx]])
+
+    def _apply_stats_visibility(self) -> None:
+        show = self._cfg.get("show_stats", True)
+        self._s_fps.setVisible(show)
+        self._s_lat.setVisible(show)
+        self._s_res.setVisible(show)
 
     # ── Connection control ────────────────────────────────────────────────
 
@@ -757,7 +885,11 @@ class MainWindow(QMainWindow):
             self._do_connect()
 
     def _do_connect(self) -> None:
-        port = int(self._port.text().strip() or "8080")
+        try:
+            port = int(self._port.text().strip() or "8080")
+        except ValueError:
+            QMessageBox.warning(self, "Input Error", "Port must be a valid number.")
+            return
 
         if self._usb.isChecked():
             ok, msg = _adb_forward(port)
@@ -766,8 +898,9 @@ class MainWindow(QMainWindow):
                 return
             self.statusBar().showMessage(f"✔  {msg}", 4000)
 
-        backend_key = self._backend.currentText()
-        backend_val = _BACKENDS.get(backend_key)
+        b_idx = self._cfg.get("backend_idx", 0)
+        b_keys = list(_BACKENDS.keys())
+        backend_val = _BACKENDS[b_keys[b_idx]] if b_idx < len(b_keys) else None
 
         self._worker = StreamWorker(
             url=self._stream_url(),
@@ -777,6 +910,7 @@ class MainWindow(QMainWindow):
         self._worker.mirror_v     = self._flip_v.isChecked()
         self._worker.rotation     = _ROT_ANGLES[self._rot.currentIndex()]
         self._worker.show_preview = self._preview_chk.isChecked()
+        self._apply_settings_to_worker()
 
         self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
@@ -799,12 +933,15 @@ class MainWindow(QMainWindow):
             self._worker.stop()
         if self._thread:
             self._thread.quit()
-            self._thread.wait(3000)
+            self._thread.wait(TIMEOUT_THREAD_JOIN)
         self._worker = None
         self._thread = None
+        if self._usb.isChecked():
+            port = int(self._port.text().strip() or "8080")
+            _adb_remove_forward(port)
         self._preview.clear_frame()
         self._set_ui_connected(False)
-        self._s_state.set_text("Disconnected", "#5c6370")
+        self._s_state.set_text("Disconnected", "#71717a")
         for row in (self._s_fps, self._s_lat, self._s_res):
             row.set_text("—")
 
@@ -816,7 +953,7 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(float)
     def _on_latency(self, v: float) -> None:
-        color = "#40c057" if v < 80 else "#fcc419" if v < 250 else "#fa5252"
+        color = "#10b981" if v < LATENCY_GOOD_MS else "#eab308" if v < LATENCY_WARN_MS else "#ef4444"
         self._s_lat.set_text(f"{v:.0f} ms", color)
 
     @pyqtSlot(int, int)
@@ -825,19 +962,11 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str)
     def _on_status(self, state: str) -> None:
-        label, color = _STATUS_STYLE.get(state, ("Unknown", "#5c6370"))
+        label, color = _STATUS_STYLE.get(state, ("Unknown", "#71717a"))
         self._s_state.set_text(f"● {label}", color)
 
         if state == "disconnected" and self._connected:
-            self._connected = False
-            if self._thread:
-                self._thread.quit()
-                self._thread = None
-            self._worker = None
-            self._preview.clear_frame()
-            self._set_ui_connected(False)
-            for row in (self._s_fps, self._s_lat, self._s_res):
-                row.set_text("—")
+            self._do_disconnect()
 
     @pyqtSlot(str)
     def _on_error(self, msg: str) -> None:
@@ -873,20 +1002,20 @@ class MainWindow(QMainWindow):
 
     def _set_ui_connected(self, connected: bool) -> None:
         if connected:
-            self._conn_btn.setText("⏹   Disconnect")
+            self._conn_btn.setText("Disconnect")
             self._conn_btn.setStyleSheet(
                 "QPushButton#ConnBtn {"
-                "  background:#c92a2a; border:none; color:#fff;"
-                "  font-size:13px; font-weight:600; padding:10px; border-radius:6px;"
+                "  background:#ef4444; border:none; color:#ffffff;"
+                "  font-size:14px; font-weight:600; min-height:36px; border-radius:6px;"
                 "}"
-                "QPushButton#ConnBtn:hover { background:#a61e1e; }"
-                "QPushButton#ConnBtn:pressed { background:#8e1818; }"
+                "QPushButton#ConnBtn:hover { background:#dc2626; }"
+                "QPushButton#ConnBtn:pressed { background:#b91c1c; }"
             )
         else:
-            self._conn_btn.setText("▶   Connect")
+            self._conn_btn.setText("Connect")
             self._conn_btn.setStyleSheet("")
 
-        for w in (self._ip, self._port, self._usb, self._backend):
+        for w in (self._ip, self._port, self._usb, self._settings_btn):
             w.setEnabled(not connected)
 
         if not connected and self._usb.isChecked():
@@ -900,7 +1029,10 @@ class MainWindow(QMainWindow):
             self._worker.stop()
         if self._thread:
             self._thread.quit()
-            self._thread.wait(3000)
+            self._thread.wait(TIMEOUT_THREAD_JOIN)
+        if self._usb.isChecked():
+            port = int(self._port.text().strip() or "8080")
+            _adb_remove_forward(port)
         event.accept()
 
 
@@ -910,125 +1042,142 @@ class MainWindow(QMainWindow):
 
 _QSS = """
 /* ─ Base ─────────────────────────────────────────────────────────── */
-QMainWindow, QWidget {
-    background: #14161c;
-    color: #b8bcc8;
+QMainWindow, QDialog, QWidget {
+    background: #09090b;
+    color: #f4f4f5;
     font-family: "Segoe UI", "Inter", "SF Pro Text", Helvetica, Arial, sans-serif;
     font-size: 13px;
 }
 
 /* ─ Controls panel ───────────────────────────────────────────────── */
 #CtrlPanel {
-    background: #191b22;
-    border-left: 1px solid #20232c;
+    background: #121316;
+    border-left: 1px solid #27272a;
+}
+
+/* ─ Cards / Groups ───────────────────────────────────────────────── */
+QFrame#Card {
+    background: #18181b;
+    border: 1px solid #27272a;
+    border-radius: 8px;
+}
+QLabel {
+    color: #a1a1aa;
+    background: transparent;
 }
 
 /* ─ Inputs ───────────────────────────────────────────────────────── */
 QLineEdit {
-    background: #1e2028;
-    border: 1px solid #2a2e3c;
-    border-radius: 5px;
-    padding: 5px 9px;
-    color: #dde0e8;
-    selection-background-color: #12b886;
+    background: #27272a;
+    border: 1px solid #3f3f46;
+    border-radius: 6px;
+    padding: 6px 10px;
+    color: #f4f4f5;
+    selection-background-color: #3b82f6;
+    min-height: 22px;
 }
-QLineEdit:focus { border-color: #12b886; }
-QLineEdit:disabled { color: #343848; border-color: #1e2028; background: #181a20; }
+QLineEdit:focus { border-color: #3b82f6; }
+QLineEdit:disabled { color: #71717a; background: #18181b; }
 
 /* ─ Combo boxes ──────────────────────────────────────────────────── */
 QComboBox {
-    background: #1e2028;
-    border: 1px solid #2a2e3c;
-    border-radius: 5px;
-    padding: 5px 9px;
-    color: #b8bcc8;
+    background: #27272a;
+    border: 1px solid #3f3f46;
+    border-radius: 6px;
+    padding: 6px 10px;
+    color: #f4f4f5;
+    min-height: 22px;
 }
-QComboBox:hover { border-color: #3a3f52; }
-QComboBox:disabled { color: #343848; }
-QComboBox::drop-down { border: none; width: 20px; }
+QComboBox:hover { border-color: #52525b; }
+QComboBox:disabled { color: #71717a; }
+QComboBox::drop-down { border: none; width: 24px; }
 QComboBox::down-arrow {
     width: 0; height: 0;
     border-left:  4px solid transparent;
     border-right: 4px solid transparent;
-    border-top:   5px solid #5c6370;
-    margin-right: 5px;
+    border-top:   5px solid #a1a1aa;
+    margin-right: 8px;
 }
 QComboBox QAbstractItemView {
-    background: #1e2028;
-    border: 1px solid #2a2e3c;
-    selection-background-color: #12b886;
+    background: #27272a;
+    border: 1px solid #3f3f46;
+    selection-background-color: #3b82f6;
     selection-color: #fff;
-    color: #b8bcc8;
+    color: #f4f4f5;
     outline: none;
     padding: 2px;
 }
 
 /* ─ Checkboxes ───────────────────────────────────────────────────── */
-QCheckBox { color: #b8bcc8; spacing: 7px; font-size: 12px; }
+QCheckBox { color: #f4f4f5; spacing: 8px; font-size: 13px; background: transparent; }
 QCheckBox::indicator {
-    width: 16px; height: 16px;
-    border-radius: 3px;
-    border: 1.5px solid #3a3f52;
-    background: #1e2028;
+    width: 18px; height: 18px;
+    border-radius: 4px;
+    border: 1px solid #3f3f46;
+    background: #18181b;
 }
-QCheckBox::indicator:checked { background: #12b886; border-color: #12b886; }
-QCheckBox::indicator:disabled { background: #181a20; border-color: #252932; }
-QCheckBox:disabled { color: #343848; }
+QCheckBox::indicator:hover { border-color: #52525b; }
+QCheckBox::indicator:checked { background: #3b82f6; border-color: #3b82f6; }
+QCheckBox::indicator:disabled { background: #09090b; border-color: #27272a; }
+QCheckBox:disabled { color: #52525b; }
 
 /* ─ Buttons (default) ────────────────────────────────────────────── */
 QPushButton {
-    background: #1e2028;
-    border: 1px solid #2a2e3c;
+    background: #27272a;
+    border: 1px solid #3f3f46;
     border-radius: 6px;
-    padding: 7px 12px;
-    color: #b8bcc8;
-    font-size: 12px;
+    padding: 7px 14px;
+    color: #e4e4e7;
+    font-size: 13px;
+    font-weight: 500;
+    min-height: 22px;
 }
-QPushButton:hover  { background: #252932; border-color: #3a3f52; }
-QPushButton:pressed { background: #191b22; }
+QPushButton:hover  { background: #3f3f46; border-color: #52525b; }
+QPushButton:pressed { background: #18181b; }
 QPushButton:checked {
-    background: #0b7a59;
-    border-color: #0b7a59;
-    color: #d0fff3;
+    background: #3b82f6;
+    border-color: #3b82f6;
+    color: #ffffff;
 }
-QPushButton:checked:hover { background: #0a6d4f; }
-QPushButton:disabled { color: #2e3244; border-color: #1e2028; background: #181a20; }
+QPushButton:checked:hover { background: #2563eb; }
+QPushButton:disabled { color: #71717a; border-color: #3f3f46; background: #18181b; }
 
 /* ─ Connect button ───────────────────────────────────────────────── */
 QPushButton#ConnBtn {
-    background: #12b886;
+    background: #10b981;
     border: none;
-    color: #fff;
-    font-size: 13px;
+    color: #ffffff;
+    font-size: 14px;
     font-weight: 600;
-    padding: 10px;
+    min-height: 36px;
     border-radius: 6px;
 }
-QPushButton#ConnBtn:hover   { background: #0ca678; }
-QPushButton#ConnBtn:pressed { background: #09926a; }
-QPushButton#ConnBtn:disabled { background: #1e2028; color: #343848; }
+QPushButton#ConnBtn:hover   { background: #059669; }
+QPushButton#ConnBtn:pressed { background: #047857; }
+QPushButton#ConnBtn:disabled { background: #27272a; color: #52525b; }
 
 /* ─ Scrollbars ───────────────────────────────────────────────────── */
 QScrollBar:vertical {
-    background: #14161c; width: 8px; border-radius: 4px;
+    background: #09090b; width: 10px; border-radius: 5px;
 }
 QScrollBar::handle:vertical {
-    background: #2a2e3c; border-radius: 4px; min-height: 20px;
+    background: #27272a; border-radius: 5px; min-height: 24px;
 }
+QScrollBar::handle:vertical:hover { background: #3f3f46; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 
 /* ─ Tool tips ────────────────────────────────────────────────────── */
 QToolTip {
-    background: #1e2028;
-    border: 1px solid #3a3f52;
-    color: #b8bcc8;
-    padding: 4px 8px;
+    background: #18181b;
+    border: 1px solid #3f3f46;
+    color: #f4f4f5;
+    padding: 6px 10px;
     border-radius: 4px;
-    font-size: 11px;
+    font-size: 12px;
 }
 
 /* ─ Status bar ───────────────────────────────────────────────────── */
-QStatusBar { background: #10111a; color: #444b5c; font-size: 11px; border: none; }
+QStatusBar { background: #09090b; color: #71717a; font-size: 12px; border: none; border-top: 1px solid #27272a; }
 QStatusBar::item { border: none; }
 """
 

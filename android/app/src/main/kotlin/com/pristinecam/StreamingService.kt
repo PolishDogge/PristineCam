@@ -9,6 +9,7 @@ import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.YuvImage
 import android.os.Binder
+import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.util.Size
@@ -217,7 +218,7 @@ class StreamingService : LifecycleService() {
      *   - [ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER]:
      *     if the device can't do exactly 1280×720 it picks the nearest lower,
      *     then the nearest higher — so we never get an absurd 4K frame.
-     *   - [STRATEGY_KEEP_ONLY_LATEST]: the analysis executor always works on
+     *   - [ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST]: the analysis executor always works on
      *     the freshest frame; stale frames are dropped by CameraX.
      *   - Output format is YUV_420_888 (CameraX default); we convert to JPEG
      *     manually via [YuvImage] — this is faster than going through
@@ -375,10 +376,12 @@ class StreamingService : LifecycleService() {
 
     private fun postForegroundNotification() {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        nm.createNotificationChannel(
-            NotificationChannel(NOTIF_CHANNEL_ID, "Camera Stream", NotificationManager.IMPORTANCE_LOW)
-                .apply { description = "PristineCam is streaming" }
-        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            nm.createNotificationChannel(
+                NotificationChannel(NOTIF_CHANNEL_ID, "Camera Stream", NotificationManager.IMPORTANCE_LOW)
+                    .apply { description = "PristineCam is streaming" }
+            )
+        }
 
         val stopPi = PendingIntent.getService(
             this, 0,

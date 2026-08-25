@@ -36,5 +36,5 @@ Desktop.ini
 *.log
 *.tmp
 *.temp
-
 pristinecam_settings.json
+*.spec
