@@ -44,7 +44,7 @@ try:
         Qt, QObject, QThread, QTimer,
         pyqtSignal, pyqtSlot,
     )
-    from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPixmap
+    from PyQt6.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPixmap
     from PyQt6.QtWidgets import (
         QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame, QHBoxLayout,
         QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
@@ -86,15 +86,23 @@ LATENCY_GOOD_MS     = 80
 LATENCY_WARN_MS     = 250
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Configuration
+# Configuration & Paths
 # ─────────────────────────────────────────────────────────────────────────────
 
 if getattr(sys, 'frozen', False):
-    # Running as compiled PyInstaller executable
+    # Running as compiled PyInstaller executable — save settings alongside the .exe
     _base_dir = Path(sys.executable).parent
 else:
     # Running as a script
     _base_dir = Path(__file__).parent
+
+def resource_path(relative_path: str) -> Path:
+    """Get absolute path to bundled resource (works in dev and PyInstaller sys._MEIPASS)."""
+    try:
+        base_path = Path(sys._MEIPASS)  # type: ignore[attr-defined]
+    except AttributeError:
+        base_path = Path(__file__).parent
+    return base_path / relative_path
 
 CONFIG_FILE = _base_dir / "pristinecam_settings.json"
 _DEFAULTS: dict = {
@@ -662,6 +670,11 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._restore_settings()
         self.setStyleSheet(_QSS)
+        
+        icon_path = resource_path("assets/icon.png")
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
+            
         self._start_discovery()
 
     # ── UI construction ──────────────────────────────────────────────────
