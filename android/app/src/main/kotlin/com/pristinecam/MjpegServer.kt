@@ -55,12 +55,14 @@ class MjpegServer(port: Int) : NanoHTTPD(port) {
 
     // ── Request routing ───────────────────────────────────────────────────────
 
-    override fun serve(session: IHTTPSession): Response = when (session.uri) {
-        "/video_feed" -> serveMjpegStream()
-        "/"           -> serveIndexPage()
-        else          -> newFixedLengthResponse(
-            Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Not found"
-        )
+    override fun serve(session: IHTTPSession): Response {
+        return when (session.uri) {
+            "/video_feed" -> serveMjpegStream()
+            "/"           -> serveIndexPage()
+            else          -> newFixedLengthResponse(
+                Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Not found"
+            )
+        }
     }
 
     private fun serveIndexPage(): Response = newFixedLengthResponse(

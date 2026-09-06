@@ -44,7 +44,7 @@ try:
         Qt, QObject, QThread, QTimer,
         pyqtSignal, pyqtSlot,
     )
-    from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPixmap
+    from PyQt6.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPixmap
     from PyQt6.QtWidgets import (
         QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame, QHBoxLayout,
         QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
@@ -60,6 +60,12 @@ try:
     HAS_VCAM = True
 except ImportError:
     HAS_VCAM = False
+
+try:
+    from zeroconf_discovery import DiscoveryWorker, is_available as _zc_available
+    HAS_ZEROCONF = _zc_available()
+except ImportError:
+    HAS_ZEROCONF = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -80,15 +86,23 @@ LATENCY_GOOD_MS     = 80
 LATENCY_WARN_MS     = 250
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Configuration
+# Configuration & Paths
 # ─────────────────────────────────────────────────────────────────────────────
 
 if getattr(sys, 'frozen', False):
-    # Running as compiled PyInstaller executable
+    # Running as compiled PyInstaller executable — save settings alongside the .exe
     _base_dir = Path(sys.executable).parent
 else:
     # Running as a script
     _base_dir = Path(__file__).parent
+
+def resource_path(relative_path: str) -> Path:
+    """Get absolute path to bundled resource (works in dev and PyInstaller sys._MEIPASS)."""
+    try:
+        base_path = Path(sys._MEIPASS)  # type: ignore[attr-defined]
+    except AttributeError:
+        base_path = Path(__file__).parent
+    return base_path / relative_path
 
 CONFIG_FILE = _base_dir / "pristinecam_settings.json"
 _DEFAULTS: dict = {
@@ -605,36 +619,37 @@ class SettingsDialog(QDialog):
         self.stats_chk = QCheckBox("Show Performance Stats")
         self.stats_chk.setToolTip("Toggle visibility of FPS, Latency, and Resolution.")
         form.addRow("", self.stats_chk)
-        
+
         lay.addLayout(form)
-        
+
         bbox = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         bbox.accepted.connect(self.accept)
         bbox.rejected.connect(self.reject)
         lay.addWidget(bbox)
-        
+
         # Load values
         fps = cfg.get("preview_fps", 30)
         idx = {5: 0, 10: 1, 15: 2, 30: 3}.get(fps, 3)
         self.fps_cb.setCurrentIndex(idx)
-        
+
         res = cfg.get("preview_res", "480x270")
         idx = {"480x270": 0, "640x360": 1, "960x540": 2}.get(res, 3)
         self.res_cb.setCurrentIndex(idx)
-        
+
         self.backend_cb.setCurrentIndex(cfg.get("backend_idx", 0))
         self.stats_chk.setChecked(cfg.get("show_stats", False))
-        
+
     def accept(self):
         fps_val = [5, 10, 15, 30][self.fps_cb.currentIndex()]
         self.cfg["preview_fps"] = fps_val
-        
+
         res_val = ["480x270", "640x360", "960x540", "Native"][self.res_cb.currentIndex()]
         self.cfg["preview_res"] = res_val
-        
+
         self.cfg["backend_idx"] = self.backend_cb.currentIndex()
         self.cfg["show_stats"] = self.stats_chk.isChecked()
         super().accept()
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -650,9 +665,17 @@ class MainWindow(QMainWindow):
         self._thread:  Optional[QThread]      = None
         self._connected = False
 
+        self._discovered: dict[str, tuple[str, int]] = {}  # name -> (host, port)
+        self._discovery: Optional[DiscoveryWorker] = None
         self._build_ui()
         self._restore_settings()
         self.setStyleSheet(_QSS)
+        
+        icon_path = resource_path("assets/icon.png")
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
+            
+        self._start_discovery()
 
     # ── UI construction ──────────────────────────────────────────────────
 
@@ -702,7 +725,7 @@ class MainWindow(QMainWindow):
 
         # ··· Connection ·················································
         right_lay.addWidget(_SectionLabel("Connection"))
-        
+
         ip_port_lay = QHBoxLayout()
         ip_port_lay.setContentsMargins(0, 0, 0, 0)
         ip_port_lay.setSpacing(8)
@@ -715,6 +738,20 @@ class MainWindow(QMainWindow):
         self._port.setMaximumWidth(60)
         ip_port_lay.addWidget(self._port, stretch=1)
         right_lay.addLayout(ip_port_lay)
+        # Auto-discovery row — only built when zeroconf is available
+        if HAS_ZEROCONF:
+            self._discover_cb = QComboBox()
+            self._discover_cb.setPlaceholderText("Found devices will appear here")
+            self._discover_cb.setToolTip("PristineCam devices found on your network — select one to connect instantly")
+            self._discover_cb.currentIndexChanged.connect(self._on_discover_selected)
+            self._discover_cb.setVisible(False)   # hidden until devices appear
+            right_lay.addWidget(self._discover_cb)
+
+            self._scan_btn = QPushButton("Scan for devices")
+            self._scan_btn.setToolTip("Restart mDNS scan for PristineCam devices on the local network")
+            self._scan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._scan_btn.clicked.connect(self._rescan_devices)
+            right_lay.addWidget(self._scan_btn)
 
         self._usb = QCheckBox("USB Mode (ADB port-forward)")
         self._usb.setToolTip("Use ADB over USB instead of Wi-Fi for lower latency.")
@@ -833,6 +870,85 @@ class MainWindow(QMainWindow):
             "show_preview": self._preview_chk.isChecked(),
         })
         _save_cfg(self._cfg)
+
+    # ── mDNS Discovery ───────────────────────────────────────────────
+
+    def _start_discovery(self) -> None:
+        if not HAS_ZEROCONF:
+            return
+        try:
+            self._discovery = DiscoveryWorker(parent=self)
+            # Qt signals: delivered on main thread automatically, no QTimer needed
+            self._discovery.device_found.connect(self._on_device_discovered)
+            self._discovery.device_lost.connect(self._on_device_lost)
+            self._discovery.start()
+        except Exception as exc:
+            self.statusBar().showMessage(f"Discovery unavailable: {exc}", 5000)
+
+    def _rescan_devices(self) -> None:
+        """Stop and restart the mDNS scanner (triggered by the Scan button)."""
+        if not HAS_ZEROCONF:
+            return
+        self._discovered.clear()
+        self._refresh_device_dropdown()
+        self._scan_btn.setEnabled(False)
+        self._scan_btn.setText("Scanning…")
+        if self._discovery:
+            self._discovery.stop()
+            self._discovery = None
+        self._start_discovery()
+        # Re-enable the button after 4 s regardless of results
+        QTimer.singleShot(4000, self._scan_done)
+
+    def _scan_done(self) -> None:
+        if not HAS_ZEROCONF:
+            return
+        self._scan_btn.setEnabled(True)
+        self._scan_btn.setText("Scan for devices")
+
+    def _on_device_discovered(self, host: str, port: int, name: str) -> None:
+        """Slot — called on main thread via Qt queued connection."""
+        self._discovered[name] = (host, port)
+        self._refresh_device_dropdown()
+
+    def _on_device_lost(self, name: str) -> None:
+        """Slot — called on main thread via Qt queued connection."""
+        self._discovered.pop(name, None)
+        self._refresh_device_dropdown()
+
+    def _refresh_device_dropdown(self) -> None:
+        if not HAS_ZEROCONF:
+            return
+        cb = self._discover_cb
+        cb.blockSignals(True)
+        cb.clear()
+        if self._discovered:
+            for name, (host, port) in self._discovered.items():
+                # Show short label — strip the service-type suffix for readability
+                short = name.replace("._pristinecam._tcp.local.", "")
+                label = f"{short}  ({host}:{port})"
+                cb.addItem(label, (host, port))
+            cb.setCurrentIndex(-1)   # nothing pre-selected
+            cb.setVisible(True)
+        else:
+            cb.setVisible(False)
+        cb.blockSignals(False)
+
+    def _on_discover_selected(self, index: int) -> None:
+        if not HAS_ZEROCONF or index < 0:
+            return
+        data = self._discover_cb.itemData(index)
+        if data:
+            host, port = data
+            self._ip.setText(host)
+            self._port.setText(str(port))
+            # Reset combo immediately so the user can re-select after disconnect
+            self._discover_cb.blockSignals(True)
+            self._discover_cb.setCurrentIndex(-1)
+            self._discover_cb.blockSignals(False)
+            # Auto-connect
+            if not self._connected:
+                self._do_connect()
 
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self._cfg, self)
@@ -1018,6 +1134,15 @@ class MainWindow(QMainWindow):
         for w in (self._ip, self._port, self._usb, self._settings_btn):
             w.setEnabled(not connected)
 
+        # Discovery controls: disable while connected; restore on disconnect
+        if HAS_ZEROCONF:
+            self._scan_btn.setEnabled(not connected)
+            if connected:
+                self._discover_cb.setVisible(False)
+            else:
+                # Restore combo visibility if we still know about devices
+                self._discover_cb.setVisible(bool(self._discovered))
+
         if not connected and self._usb.isChecked():
             self._ip.setEnabled(False)
 
@@ -1033,6 +1158,8 @@ class MainWindow(QMainWindow):
         if self._usb.isChecked():
             port = int(self._port.text().strip() or "8080")
             _adb_remove_forward(port)
+        if self._discovery:
+            self._discovery.stop()
         event.accept()
 
 
