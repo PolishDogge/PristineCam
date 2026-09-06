@@ -16,7 +16,22 @@ import androidx.camera.view.PreviewView
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CameraAlt
@@ -24,20 +39,45 @@ import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
-import androidx.lifecycle.compose.LocalLifecycleOwner
-import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.zIndex
+import kotlin.OptIn
+import androidx.annotation.OptIn as AndroidXOptIn
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.pristinecam.ui.theme.PristineCamTheme
 
@@ -61,22 +101,21 @@ class MainActivity : ComponentActivity() {
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
-        if (granted) bindToService() else finish() // can't operate without camera
+        if (granted) bindToService() else finish()
     }
 
     // ── Activity lifecycle ──────────────────────────────────────────────────────────
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
         enableEdgeToEdge()
         checkAndRequestPermission()
         setContent {
-            CompositionLocalProvider(LocalLifecycleOwner provides this) {
+            androidx.compose.runtime.CompositionLocalProvider(LocalLifecycleOwner provides this) {
                 PristineCamTheme {
                     val svc = service
                     if (svc != null) {
-                        MainScreen(service = svc)
+                        MainScreen(service = svc, activity = this)
                     } else {
                         SplashScreen()
                     }
@@ -86,8 +125,6 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
-        // Detach the preview surface when the Activity leaves the screen.
-        // The camera and HTTP server keep running in the service.
         service?.attachPreview(null)
         super.onStop()
     }
@@ -114,8 +151,6 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun bindToService() {
-        // Start the service so it outlives the activity binding,
-        // then bind to obtain a reference to the service object.
         val intent = Intent(this, StreamingService::class.java)
         ContextCompat.startForegroundService(this, intent)
         bindService(intent, serviceConnection, BIND_AUTO_CREATE)
@@ -126,18 +161,25 @@ class MainActivity : ComponentActivity() {
 // Composables
 // ─────────────────────────────────────────────────────────────────────────────
 
+@OptIn(ExperimentalMaterial3Api::class)
+@AndroidXOptIn(ExperimentalCamera2Interop::class)
 @Composable
-private fun MainScreen(service: StreamingService) {
-    val context      = LocalContext.current
-    val isStreaming  by service.isStreaming.collectAsStateWithLifecycle()
-    val streamUrl    by service.streamUrl.collectAsStateWithLifecycle()
-    val currentRes   by service.resolution.collectAsStateWithLifecycle()
+private fun MainScreen(service: StreamingService, activity: ComponentActivity) {
+    val isStreaming       by service.isStreaming.collectAsStateWithLifecycle()
+    val streamUrl         by service.streamUrl.collectAsStateWithLifecycle()
+    val currentRes        by service.resolution.collectAsStateWithLifecycle()
+    val screenSaverActive by service.isScreenSaverActive.collectAsStateWithLifecycle()
+    val torchEnabled      by service.torchEnabled.collectAsStateWithLifecycle()
+    val exposureIndex     by service.exposureIndex.collectAsStateWithLifecycle()
+    val wbMode            by service.wbMode.collectAsStateWithLifecycle()
 
-    var showPreview   by remember { mutableStateOf(true) }
-    var isFrontCamera by remember { mutableStateOf(false) }
-    val previewView   = remember { PreviewView(context) }
+    var showPreview          by remember { mutableStateOf(true) }
+    var isFrontCamera        by remember { mutableStateOf(false) }
+    var showOptions          by remember { mutableStateOf(false) }
+    var showCameraControls   by remember { mutableStateOf(false) }   // per-session option, default OFF
+    val previewView          = remember { PreviewView(activity) }
 
-    // Attach/detach the CameraX Preview use case when relevant state changes.
+    // Attach/detach CameraX Preview.
     LaunchedEffect(showPreview, isStreaming) {
         service.attachPreview(if (showPreview && isStreaming) previewView else null)
     }
@@ -145,42 +187,43 @@ private fun MainScreen(service: StreamingService) {
         onDispose { service.attachPreview(null) }
     }
 
-    // Manage screen wake / brightness based on streaming state.
-    // • Streaming  → keep screen on but dim it (saves battery, stream continues).
-    // • Idle       → restore normal brightness and allow the OS to lock the screen.
-    val window = (context as? ComponentActivity)?.window
+    // Brightness management.
     SideEffect {
-        window?.let { w ->
-            if (isStreaming) {
-                // Keep screen alive so the camera service isn't throttled by Doze,
-                // but dim the display to save battery.
+        activity.window?.let { w ->
+            if (isStreaming || screenSaverActive) {
                 w.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                w.attributes = w.attributes.apply {
-                    screenBrightness = 0.01f
-                }
             } else {
-                // Let Android's normal timeout and lock apply.
                 w.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                w.attributes = w.attributes.apply {
-                    screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+            }
+            w.attributes = w.attributes.apply {
+                screenBrightness = when {
+                    screenSaverActive -> 0.0f
+                    isStreaming       -> 0.01f
+                    else              -> WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
                 }
             }
         }
     }
 
     val btnColor by animateColorAsState(
-        targetValue = if (isStreaming) Color(0xFFE53935) else Color(0xFF00897B),
+        targetValue  = if (isStreaming) Color(0xFFE53935) else Color(0xFF00897B),
         animationSpec = tween(300),
-        label = "btnColor"
+        label        = "btnColor"
     )
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
-            .statusBarsPadding()
-            .navigationBarsPadding()
-    ) {
+    // Wrap everything in a Box so we can layer the OLED overlay on top
+    // WITHOUT removing the rest of the UI (including the camera preview surface)
+    // from the composition tree. Removing the AndroidView via early return caused
+    // the PreviewView to lose its window and release its surface, stalling CameraX.
+    Box(modifier = Modifier.fillMaxSize()) {
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.background)
+                .statusBarsPadding()
+                .navigationBarsPadding()
+        ) {
 
         // ── App bar ────────────────────────────────────────────────────────────────
         Row(
@@ -190,10 +233,10 @@ private fun MainScreen(service: StreamingService) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Icon(
-                imageVector    = Icons.Default.CameraAlt,
+                imageVector        = Icons.Default.CameraAlt,
                 contentDescription = null,
-                tint           = MaterialTheme.colorScheme.primary,
-                modifier       = Modifier.size(22.dp)
+                tint               = MaterialTheme.colorScheme.primary,
+                modifier           = Modifier.size(22.dp)
             )
             Spacer(Modifier.width(10.dp))
             Text(
@@ -201,7 +244,7 @@ private fun MainScreen(service: StreamingService) {
                 style = MaterialTheme.typography.titleLarge,
             )
             Spacer(Modifier.weight(1f))
-            // Live indicator dot
+            // Live indicator
             if (isStreaming) {
                 Surface(
                     shape = RoundedCornerShape(50),
@@ -209,7 +252,7 @@ private fun MainScreen(service: StreamingService) {
                 ) {
                     Row(
                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+                        verticalAlignment    = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(5.dp)
                     ) {
                         Surface(
@@ -224,6 +267,15 @@ private fun MainScreen(service: StreamingService) {
                         )
                     }
                 }
+                Spacer(Modifier.width(8.dp))
+            }
+            // ⚙ Options button
+            IconButton(onClick = { showOptions = true }) {
+                Icon(
+                    imageVector        = Icons.Default.Settings,
+                    contentDescription = "Options",
+                    tint               = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
 
@@ -240,7 +292,16 @@ private fun MainScreen(service: StreamingService) {
             if (showPreview && isStreaming) {
                 AndroidView(
                     factory  = { previewView },
-                    modifier = Modifier.fillMaxSize()
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .pointerInput(Unit) {
+                            detectTapGestures { offset ->
+                                val point = previewView.meteringPointFactory.createPoint(
+                                    offset.x, offset.y
+                                )
+                                service.tapToFocus(point)
+                            }
+                        }
                 )
             } else {
                 Column(
@@ -248,10 +309,10 @@ private fun MainScreen(service: StreamingService) {
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Icon(
-                        imageVector    = Icons.Default.CameraAlt,
+                        imageVector        = Icons.Default.CameraAlt,
                         contentDescription = null,
-                        tint           = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
-                        modifier       = Modifier.size(52.dp)
+                        tint               = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
+                        modifier           = Modifier.size(52.dp)
                     )
                     Text(
                         text  = when {
@@ -267,7 +328,7 @@ private fun MainScreen(service: StreamingService) {
 
         Spacer(Modifier.height(20.dp))
 
-        // ── Controls ─────────────────────────────────────────────────────────────────
+        // ── Controls ──────────────────────────────────────────────────────────────
         Column(
             modifier = Modifier.padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
@@ -275,9 +336,9 @@ private fun MainScreen(service: StreamingService) {
 
             // URL card
             Surface(
-                modifier      = Modifier.fillMaxWidth(),
-                shape         = RoundedCornerShape(14.dp),
-                color         = MaterialTheme.colorScheme.surfaceVariant,
+                modifier       = Modifier.fillMaxWidth(),
+                shape          = RoundedCornerShape(14.dp),
+                color          = MaterialTheme.colorScheme.surfaceVariant,
                 tonalElevation = 1.dp
             ) {
                 Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
@@ -289,9 +350,7 @@ private fun MainScreen(service: StreamingService) {
                     Spacer(Modifier.height(4.dp))
                     Text(
                         text  = streamUrl ?: "Start streaming to see the URL",
-                        style = MaterialTheme.typography.bodyMedium.copy(
-                            fontFamily = if (streamUrl != null) FontFamily.Monospace else FontFamily.Default
-                        ),
+                        style = MaterialTheme.typography.bodyMedium,
                         color = if (streamUrl != null)
                             MaterialTheme.colorScheme.onSurface
                         else
@@ -306,8 +365,8 @@ private fun MainScreen(service: StreamingService) {
                     val action = if (isStreaming) StreamingService.ACTION_STOP
                                  else             StreamingService.ACTION_START
                     ContextCompat.startForegroundService(
-                        context,
-                        Intent(context, StreamingService::class.java).apply { this.action = action }
+                        activity,
+                        Intent(activity, StreamingService::class.java).apply { this.action = action }
                     )
                 },
                 modifier = Modifier
@@ -322,15 +381,15 @@ private fun MainScreen(service: StreamingService) {
                 )
             }
 
-            // Preview toggle + Camera flip + Settings
+            // Preview toggle + Camera flip row
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier              = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 OutlinedButton(
-                    onClick   = { showPreview = !showPreview },
-                    modifier  = Modifier.weight(1f).height(48.dp),
-                    shape     = RoundedCornerShape(12.dp)
+                    onClick  = { showPreview = !showPreview },
+                    modifier = Modifier.weight(1f).height(48.dp),
+                    shape    = RoundedCornerShape(12.dp)
                 ) {
                     Icon(
                         imageVector = if (showPreview) Icons.Default.Visibility
@@ -366,107 +425,238 @@ private fun MainScreen(service: StreamingService) {
                 }
             }
 
-            // ── Resolution selector row ──────────────────────────────────────
-            ResolutionSelector(
-                current   = currentRes,
-                onSelect  = { service.setResolution(it) }
-            )
-        }
-    }
-}
-
-// ── Resolution selector component ────────────────────────────────────────────
-
-@Composable
-private fun ResolutionSelector(
-    current: StreamingService.StreamResolution,
-    onSelect: (StreamingService.StreamResolution) -> Unit,
-) {
-    var expanded by remember { mutableStateOf(false) }
-
-    Surface(
-        modifier      = Modifier.fillMaxWidth(),
-        shape         = RoundedCornerShape(14.dp),
-        color         = MaterialTheme.colorScheme.surfaceVariant,
-        tonalElevation = 1.dp
-    ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Icon(
-                imageVector        = Icons.Default.Settings,
-                contentDescription = null,
-                modifier           = Modifier.size(18.dp),
-                tint               = MaterialTheme.colorScheme.primary
-            )
-            Spacer(Modifier.width(10.dp))
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text  = "Stream Resolution",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.primary
-                )
-                Spacer(Modifier.height(2.dp))
-                Text(
-                    text  = "${current.label}  (${current.size.width}×${current.size.height})",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
-            }
-
-            Box {
-                OutlinedButton(
-                    onClick = { expanded = true },
-                    shape   = RoundedCornerShape(10.dp),
-                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
+            // ── Advanced camera controls (shown only when enabled in Options) ─────
+            if (showCameraControls && isStreaming) {
+                Surface(
+                    modifier       = Modifier.fillMaxWidth(),
+                    shape          = RoundedCornerShape(14.dp),
+                    color          = MaterialTheme.colorScheme.surfaceVariant,
+                    tonalElevation = 1.dp
                 ) {
-                    Text(
-                        text  = "Change",
-                        style = MaterialTheme.typography.labelMedium
-                    )
-                }
+                    Column(
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Text(
+                            "Camera Controls",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
 
-                DropdownMenu(
-                    expanded       = expanded,
-                    onDismissRequest = { expanded = false },
-                    offset         = DpOffset(0.dp, 4.dp)
-                ) {
-                    StreamingService.StreamResolution.entries.forEach { res ->
-                        DropdownMenuItem(
-                            text = {
-                                Row(
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text(
-                                        text  = res.label,
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        fontWeight = if (res == current) FontWeight.Bold else FontWeight.Normal
-                                    )
-                                    Text(
-                                        text  = "${res.size.width}×${res.size.height}",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        // Torch
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Torch", style = MaterialTheme.typography.bodyMedium)
+                            Switch(
+                                checked         = torchEnabled,
+                                onCheckedChange = { service.setTorch(it) }
+                            )
+                        }
+
+                        // Exposure
+                        Text("Exposure", style = MaterialTheme.typography.bodyMedium)
+                        Slider(
+                            value         = exposureIndex.toFloat(),
+                            onValueChange = { service.stepExposure(it.toInt()) },
+                            valueRange    = -4f..4f,
+                            steps         = 7
+                        )
+
+                        // White balance
+                        val wbOptions = listOf("AUTO", "DAYLIGHT", "CLOUDY", "FLUORESCENT", "INCANDESCENT")
+                        var wbExpanded by remember { mutableStateOf(false) }
+                        Box {
+                            OutlinedButton(
+                                onClick        = { wbExpanded = true },
+                                shape          = RoundedCornerShape(10.dp),
+                                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
+                                modifier       = Modifier.fillMaxWidth()
+                            ) {
+                                Text("WB: $wbMode", style = MaterialTheme.typography.labelMedium)
+                            }
+                            DropdownMenu(
+                                expanded        = wbExpanded,
+                                onDismissRequest = { wbExpanded = false }
+                            ) {
+                                wbOptions.forEach { opt ->
+                                    DropdownMenuItem(
+                                        text    = { Text(opt) },
+                                        onClick = {
+                                            service.setWhiteBalance(opt)
+                                            wbExpanded = false
+                                        }
                                     )
                                 }
-                            },
-                            onClick = {
-                                onSelect(res)
-                                expanded = false
                             }
-                        )
+                        }
                     }
                 }
             }
         }
+        }   // end Column
+
+        // ── OLED saver overlay — layered on top of the Column.
+        // The Column (and its AndroidView/PreviewView) stays in the composition
+        // tree the whole time, keeping the CameraX surface alive.
+        if (screenSaverActive) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black)
+                    .pointerInput(Unit) {
+                        detectTapGestures { service.dismissScreenSaver() }
+                    }
+            )
+        }
+
+    }   // end Box
+
+    // ── Options bottom sheet ───────────────────────────────────────────────────
+    if (showOptions) {
+        val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+        ModalBottomSheet(
+            onDismissRequest = { showOptions = false },
+            sheetState       = sheetState,
+            shape            = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp)
+        ) {
+            OptionsSheet(
+                currentRes          = currentRes,
+                showCameraControls  = showCameraControls,
+                onResolutionChange  = { service.setResolution(it) },
+                onCameraControlsToggle = { showCameraControls = it },
+                onDismiss           = { showOptions = false }
+            )
+        }
     }
 }
+
+// ── Options bottom sheet content ──────────────────────────────────────────────
+
+@Composable
+private fun OptionsSheet(
+    currentRes: StreamingService.StreamResolution,
+    showCameraControls: Boolean,
+    onResolutionChange: (StreamingService.StreamResolution) -> Unit,
+    onCameraControlsToggle: (Boolean) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 24.dp)
+            .padding(bottom = 32.dp),
+        verticalArrangement = Arrangement.spacedBy(0.dp)
+    ) {
+        Text(
+            text  = "Options",
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(bottom = 20.dp)
+        )
+
+        // ── Stream Quality ─────────────────────────────────────────────────
+        Text(
+            text  = "Stream Quality",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.padding(bottom = 10.dp)
+        )
+
+        StreamingService.StreamResolution.entries.forEach { res ->
+            val selected = res == currentRes
+            Surface(
+                onClick  = { onResolutionChange(res); onDismiss() },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 3.dp),
+                shape          = RoundedCornerShape(12.dp),
+                color          = if (selected)
+                    MaterialTheme.colorScheme.primaryContainer
+                else
+                    MaterialTheme.colorScheme.surfaceVariant,
+                tonalElevation = if (selected) 2.dp else 0.dp
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+                    verticalAlignment    = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column {
+                        Text(
+                            text      = res.label,
+                            style     = MaterialTheme.typography.bodyMedium,
+                            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                            color     = if (selected)
+                                MaterialTheme.colorScheme.onPrimaryContainer
+                            else
+                                MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text  = "${res.size.width}\u00d7${res.size.height} \u00b7 30 FPS",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (selected)
+                                MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f)
+                            else
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    if (selected) {
+                        Surface(
+                            shape = RoundedCornerShape(50),
+                            color = MaterialTheme.colorScheme.primary
+                        ) {
+                            Text(
+                                text     = "Active",
+                                style    = MaterialTheme.typography.labelSmall,
+                                color    = MaterialTheme.colorScheme.onPrimary,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        HorizontalDivider(modifier = Modifier.padding(vertical = 20.dp))
+
+        // ── Advanced Camera Controls toggle ────────────────────────────────
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment    = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text  = "Advanced Camera Controls",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium
+                )
+                Text(
+                    text  = "Torch, exposure, white balance",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Spacer(Modifier.width(12.dp))
+            Switch(
+                checked         = showCameraControls,
+                onCheckedChange = onCameraControlsToggle
+            )
+        }
+    }
+}
+
+
+
+// ── Splash screen ─────────────────────────────────────────────────────────────
 
 @Composable
 private fun SplashScreen() {
     Box(
-        modifier = Modifier
+        modifier         = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background),
         contentAlignment = Alignment.Center
@@ -487,8 +677,8 @@ private fun SplashScreen() {
                 fontWeight = FontWeight.SemiBold
             )
             CircularProgressIndicator(
-                modifier  = Modifier.size(28.dp),
-                color     = MaterialTheme.colorScheme.primary,
+                modifier    = Modifier.size(28.dp),
+                color       = MaterialTheme.colorScheme.primary,
                 strokeWidth = 2.dp
             )
         }

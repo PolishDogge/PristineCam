@@ -8,14 +8,25 @@ import android.content.Intent
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.YuvImage
+import android.hardware.camera2.CaptureRequest
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
 import android.os.Binder
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.util.Size
+import androidx.camera.camera2.interop.Camera2CameraControl
+import androidx.camera.camera2.interop.CaptureRequestOptions
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
+import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
+import androidx.camera.core.MeteringPoint
 import androidx.camera.core.Preview
 import androidx.camera.core.UseCase
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
@@ -31,6 +42,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /**
  * Foreground service that owns the camera and the MJPEG HTTP server.
@@ -69,12 +81,28 @@ class StreamingService : LifecycleService() {
     private val _resolution = MutableStateFlow(StreamResolution.RES_720P)
     val resolution: StateFlow<StreamResolution> = _resolution.asStateFlow()
 
+    /** OLED saver — true = pure black overlay + brightness 0. Auto-set after 1 min of streaming. */
+    private val _isScreenSaverActive = MutableStateFlow(false)
+    val isScreenSaverActive: StateFlow<Boolean> = _isScreenSaverActive.asStateFlow()
+
+    // ── Camera controls state ─────────────────────────────────────────────────
+
+    private val _torchEnabled = MutableStateFlow(false)
+    val torchEnabled: StateFlow<Boolean> = _torchEnabled.asStateFlow()
+
+    private val _exposureIndex = MutableStateFlow(0)
+    val exposureIndex: StateFlow<Int> = _exposureIndex.asStateFlow()
+
+    private val _wbMode = MutableStateFlow("AUTO")
+    val wbMode: StateFlow<String> = _wbMode.asStateFlow()
+
     // ── Camera ────────────────────────────────────────────────────────────────
 
     private var cameraProvider: ProcessCameraProvider? = null
     private var imageAnalysis: ImageAnalysis?          = null
     private var previewUseCase: Preview?               = null
     private var cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+    private var camera: Camera? = null
 
     /** Dedicated executor for the ImageAnalysis.Analyzer — keeps encoding off
      *  the main thread and off the CameraX capture thread. */
@@ -90,6 +118,18 @@ class StreamingService : LifecycleService() {
     // ── Wake lock ─────────────────────────────────────────────────────────────
 
     private var wakeLock: PowerManager.WakeLock? = null
+
+    // ── OLED saver timer ──────────────────────────────────────────────────────
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val screenSaverRunnable = Runnable {
+        if (_isStreaming.value) _isScreenSaverActive.value = true
+    }
+
+    // ── NSD (mDNS) ────────────────────────────────────────────────────────────
+
+    private var nsdManager: NsdManager? = null
+    private var nsdRegistrationListener: NsdManager.RegistrationListener? = null
 
     // ── Binder (for Activity ↔ Service communication) ─────────────────────────
 
@@ -130,23 +170,26 @@ class StreamingService : LifecycleService() {
 
         // Auto-shutdown: when the last PC client disconnects and no new client
         // reconnects within 5 seconds, stop everything automatically.
-        // The callback fires on a background timer thread, so we post to the
-        // main looper to safely touch service/camera state.
         mjpegServer.onAllClientsDisconnected = {
-            android.os.Handler(android.os.Looper.getMainLooper()).post {
-                stopStreamingAndSelf()
-            }
+            mainHandler.post { stopStreamingAndSelf() }
         }
 
         mjpegServer.start()
+        registerNsd()
         initCamera()
         _isStreaming.value = true
         refreshStreamUrl()
+
+        // Schedule OLED saver after 1 minute of streaming.
+        mainHandler.postDelayed(screenSaverRunnable, SCREEN_SAVER_DELAY_MS)
     }
 
     /** Stop all streaming activity; the service stays alive if still bound. */
     fun stopStreaming() {
         if (!_isStreaming.value) return
+        mainHandler.removeCallbacks(screenSaverRunnable)
+        _isScreenSaverActive.value = false
+        unregisterNsd()
         releaseCamera()
         mjpegServer.onAllClientsDisconnected = null  // prevent stale callbacks
         mjpegServer.stop()
@@ -159,6 +202,18 @@ class StreamingService : LifecycleService() {
     private fun stopStreamingAndSelf() {
         stopStreaming()
         stopSelf()
+    }
+
+    /**
+     * Dismiss the OLED saver overlay (called when the user taps the black screen).
+     * Resets the auto-timer so it will trigger again after another minute.
+     */
+    fun dismissScreenSaver() {
+        _isScreenSaverActive.value = false
+        if (_isStreaming.value) {
+            mainHandler.removeCallbacks(screenSaverRunnable)
+            mainHandler.postDelayed(screenSaverRunnable, SCREEN_SAVER_DELAY_MS)
+        }
     }
 
     /**
@@ -198,6 +253,43 @@ class StreamingService : LifecycleService() {
         if (_isStreaming.value) rebindCamera()
     }
 
+    // ── Advanced camera controls ──────────────────────────────────────────────
+
+    fun setTorch(enabled: Boolean) {
+        camera?.cameraControl?.enableTorch(enabled)
+        _torchEnabled.value = enabled
+    }
+
+    fun stepExposure(index: Int) {
+        camera?.cameraControl?.setExposureCompensationIndex(index)
+        _exposureIndex.value = index
+    }
+
+    @ExperimentalCamera2Interop
+    fun setWhiteBalance(modeName: String) {
+        _wbMode.value = modeName
+        val awbMode = when (modeName) {
+            "DAYLIGHT"     -> 5
+            "CLOUDY"       -> 7
+            "FLUORESCENT"  -> 3
+            "INCANDESCENT" -> 2
+            else           -> 1  // AUTO
+        }
+        val ctrl = camera?.cameraControl ?: return
+        val cam2 = Camera2CameraControl.from(ctrl)
+        cam2.captureRequestOptions = CaptureRequestOptions.Builder()
+            .setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, awbMode)
+            .build()
+    }
+
+    fun tapToFocus(meteringPoint: MeteringPoint) {
+        val action = FocusMeteringAction.Builder(meteringPoint)
+            .addPoint(meteringPoint, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
+            .setAutoCancelDuration(3, TimeUnit.SECONDS)
+            .build()
+        camera?.cameraControl?.startFocusAndMetering(action)
+    }
+
     // ── Camera internals ──────────────────────────────────────────────────────
 
     private fun initCamera() {
@@ -213,17 +305,6 @@ class StreamingService : LifecycleService() {
     /**
      * Builds an [ImageAnalysis] use case pinned to the currently selected
      * resolution via [ResolutionSelector].
-     *
-     * Key design decisions:
-     *   - [ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER]:
-     *     if the device can't do exactly 1280×720 it picks the nearest lower,
-     *     then the nearest higher — so we never get an absurd 4K frame.
-     *   - [ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST]: the analysis executor always works on
-     *     the freshest frame; stale frames are dropped by CameraX.
-     *   - Output format is YUV_420_888 (CameraX default); we convert to JPEG
-     *     manually via [YuvImage] — this is faster than going through
-     *     RGBA_8888 → Bitmap → JPEG because it avoids the Bitmap allocation
-     *     and the color-space conversion overhead.
      */
     private fun buildImageAnalysis(): ImageAnalysis {
         val target = _resolution.value.size
@@ -241,7 +322,6 @@ class StreamingService : LifecycleService() {
         return ImageAnalysis.Builder()
             .setResolutionSelector(resolutionSelector)
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            // YUV_420_888 is the default; explicit for clarity.
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
             .build()
             .also { analysis ->
@@ -258,13 +338,14 @@ class StreamingService : LifecycleService() {
         }
         if (useCases.isNotEmpty()) {
             runCatching {
-                provider.bindToLifecycle(this, cameraSelector, *useCases.toTypedArray())
+                camera = provider.bindToLifecycle(this, cameraSelector, *useCases.toTypedArray())
             }
         }
     }
 
     private fun releaseCamera() {
         cameraProvider?.unbindAll()
+        camera = null
         cameraProvider = null
         imageAnalysis  = null
         previewUseCase = null
@@ -272,40 +353,35 @@ class StreamingService : LifecycleService() {
 
     // ── Frame encoding ────────────────────────────────────────────────────────
 
+    private var reusableNv21 = ByteArray(0)
+    private val reusableOutStream = ByteArrayOutputStream(1024 * 1024)
+
     /**
      * Convert YUV_420_888 → NV21 → JPEG on the dedicated analysis executor,
      * then push the compressed bytes into the MjpegServer's AtomicReference.
-     *
-     * This is the hot path; we avoid:
-     *   - Bitmap allocation (no toBitmap())
-     *   - RGBA conversion (stay in YUV, compress directly)
-     *   - Any synchronization (AtomicReference.set is lock-free)
      */
     private fun encodeAndPush(proxy: ImageProxy) {
         try {
             val width  = proxy.width
             val height = proxy.height
-            val nv21   = yuvToNv21(proxy)
-            val yuvImg = YuvImage(nv21, ImageFormat.NV21, width, height, null)
-            val out    = ByteArrayOutputStream(width * height / 4)
-            yuvImg.compressToJpeg(Rect(0, 0, width, height), jpegQuality, out)
-            mjpegServer.pushFrame(out.toByteArray())
+            val expectedSize = width * height * 3 / 2
+            if (reusableNv21.size != expectedSize) {
+                reusableNv21 = ByteArray(expectedSize)
+            }
+            yuvToNv21(proxy, reusableNv21)
+            val yuvImg = YuvImage(reusableNv21, ImageFormat.NV21, width, height, null)
+            reusableOutStream.reset()
+            yuvImg.compressToJpeg(Rect(0, 0, width, height), jpegQuality, reusableOutStream)
+            mjpegServer.pushFrame(reusableOutStream.toByteArray())
         } finally {
-            proxy.close()  // must always be called to unblock the analysis pipeline
+            proxy.close()
         }
     }
 
     /**
      * Converts a CameraX YUV_420_888 [ImageProxy] to a packed NV21 byte array.
-     *
-     * NV21 layout: [Y plane (w*h bytes)] [interleaved VU plane (w*h/2 bytes)]
-     *
-     * CameraX on most devices already outputs NV21 (the V/U plane *is* interleaved
-     * with rowStride == width and pixelStride == 2), so in that fast path we just
-     * bulk-copy the planes. On devices where pixelStride == 1 (rare, fully planar
-     * YUV) we manually interleave.
      */
-    private fun yuvToNv21(image: ImageProxy): ByteArray {
+    private fun yuvToNv21(image: ImageProxy, nv21: ByteArray) {
         val w = image.width
         val h = image.height
         val yPlane = image.planes[0]
@@ -314,16 +390,12 @@ class StreamingService : LifecycleService() {
 
         val ySize  = w * h
         val uvSize = w * h / 2
-        val nv21   = ByteArray(ySize + uvSize)
 
-        // ── Y plane ──────────────────────────────────────────────────────
-        val yBuf  = yPlane.buffer
-        val yRow  = yPlane.rowStride
+        val yBuf = yPlane.buffer
+        val yRow = yPlane.rowStride
         if (yRow == w) {
-            // Fast path: no padding, bulk copy
             yBuf.get(nv21, 0, ySize)
         } else {
-            // Row-by-row copy, skipping row-stride padding
             var pos = 0
             for (row in 0 until h) {
                 yBuf.position(row * yRow)
@@ -332,17 +404,14 @@ class StreamingService : LifecycleService() {
             }
         }
 
-        // ── VU interleave ────────────────────────────────────────────────
-        val vBuf     = vPlane.buffer
-        val uBuf     = uPlane.buffer
-        val vRowStr  = vPlane.rowStride
-        val vPixStr  = vPlane.pixelStride
+        val vBuf    = vPlane.buffer
+        val uBuf    = uPlane.buffer
+        val vRowStr = vPlane.rowStride
+        val vPixStr = vPlane.pixelStride
 
         if (vPixStr == 2 && vRowStr == w) {
-            // Fast path: already interleaved NV21 in memory
             vBuf.get(nv21, ySize, uvSize.coerceAtMost(vBuf.remaining()))
         } else {
-            // Slow path: pixel-by-pixel interleave
             var offset = ySize
             val halfH  = h / 2
             val halfW  = w / 2
@@ -355,7 +424,6 @@ class StreamingService : LifecycleService() {
                 }
             }
         }
-        return nv21
     }
 
     // ── Wake lock ─────────────────────────────────────────────────────────────
@@ -370,6 +438,33 @@ class StreamingService : LifecycleService() {
     private fun releaseWakeLock() {
         wakeLock?.takeIf { it.isHeld }?.release()
         wakeLock = null
+    }
+
+    // ── NSD (mDNS) ────────────────────────────────────────────────────────────
+
+    private fun registerNsd() {
+        val serviceInfo = NsdServiceInfo().apply {
+            serviceName = "PristineCam"
+            serviceType = "_pristinecam._tcp."
+            port = DEFAULT_PORT
+        }
+        val listener = object : NsdManager.RegistrationListener {
+            override fun onServiceRegistered(info: NsdServiceInfo) {}
+            override fun onRegistrationFailed(info: NsdServiceInfo, errorCode: Int) {}
+            override fun onServiceUnregistered(info: NsdServiceInfo) {}
+            override fun onUnregistrationFailed(info: NsdServiceInfo, errorCode: Int) {}
+        }
+        nsdRegistrationListener = listener
+        nsdManager = getSystemService(NSD_SERVICE) as NsdManager
+        nsdManager?.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, listener)
+    }
+
+    private fun unregisterNsd() {
+        try {
+            nsdRegistrationListener?.let { nsdManager?.unregisterService(it) }
+        } catch (_: Exception) {}
+        nsdRegistrationListener = null
+        nsdManager = null
     }
 
     // ── Foreground notification ───────────────────────────────────────────────
@@ -427,9 +522,10 @@ class StreamingService : LifecycleService() {
         const val DEFAULT_PORT    = 8080
         const val DEFAULT_QUALITY = 80  // JPEG quality 0–100
 
-        private const val NOTIF_CHANNEL_ID = "pristinecam_stream"
-        private const val NOTIF_ID         = 1
-        private const val WAKELOCK_TAG     = "PristineCam:StreamWakeLock"
-        private const val MAX_STREAM_MS    = 6L * 60 * 60 * 1000 // 6 hours max
+        private const val NOTIF_CHANNEL_ID   = "pristinecam_stream"
+        private const val NOTIF_ID           = 1
+        private const val WAKELOCK_TAG       = "PristineCam:StreamWakeLock"
+        private const val MAX_STREAM_MS      = 6L * 60 * 60 * 1000 // 6 hours max
+        private const val SCREEN_SAVER_DELAY_MS = 60_000L           // 1 minute
     }
 }
