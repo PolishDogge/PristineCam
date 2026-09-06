@@ -725,12 +725,11 @@ class MainWindow(QMainWindow):
         self._port.setMaximumWidth(60)
         ip_port_lay.addWidget(self._port, stretch=1)
         right_lay.addLayout(ip_port_lay)
-
         # Auto-discovery row — only built when zeroconf is available
         if HAS_ZEROCONF:
             self._discover_cb = QComboBox()
-            self._discover_cb.setPlaceholderText("No devices found yet…")
-            self._discover_cb.setToolTip("PristineCam devices found on your network — select one to auto-fill")
+            self._discover_cb.setPlaceholderText("Found devices will appear here")
+            self._discover_cb.setToolTip("PristineCam devices found on your network — select one to connect instantly")
             self._discover_cb.currentIndexChanged.connect(self._on_discover_selected)
             self._discover_cb.setVisible(False)   # hidden until devices appear
             right_lay.addWidget(self._discover_cb)
@@ -930,10 +929,13 @@ class MainWindow(QMainWindow):
             host, port = data
             self._ip.setText(host)
             self._port.setText(str(port))
-            # Reset so the user can re-select the same device later
+            # Reset combo immediately so the user can re-select after disconnect
             self._discover_cb.blockSignals(True)
             self._discover_cb.setCurrentIndex(-1)
             self._discover_cb.blockSignals(False)
+            # Auto-connect
+            if not self._connected:
+                self._do_connect()
 
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self._cfg, self)
@@ -1119,11 +1121,14 @@ class MainWindow(QMainWindow):
         for w in (self._ip, self._port, self._usb, self._settings_btn):
             w.setEnabled(not connected)
 
-        # Also disable discovery controls while connected
+        # Discovery controls: disable while connected; restore on disconnect
         if HAS_ZEROCONF:
             self._scan_btn.setEnabled(not connected)
             if connected:
                 self._discover_cb.setVisible(False)
+            else:
+                # Restore combo visibility if we still know about devices
+                self._discover_cb.setVisible(bool(self._discovered))
 
         if not connected and self._usb.isChecked():
             self._ip.setEnabled(False)

@@ -1,2 +1,0 @@
-It automatically found the open app meaning it found it and everything, it should also automatically connect.
-"It shows no devices found yet..." even though it found a device, change that. It should be more intuitive for the user
