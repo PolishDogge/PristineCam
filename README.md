@@ -24,11 +24,11 @@ Pre-built releases for Android and Windows are available on the [GitHub Releases
 ### Android App (`PristineCam.apk`)
 1. Download `PristineCam.apk` from the latest release to your phone.
 2. Open it to install (allow "Install unknown apps" if prompted).
-3. **⚠️ Note on False Positives:** As an indie open-source app, Google Play Protect or your antivirus may flag it as an "Unknown developer" or give a generic malware warning. This is a false positive. Tap **More details** -> **Install anyway**.
+3. **Note on False Positives:** As an indie open-source app, Google Play Protect or your antivirus may flag it as an "Unknown developer" or give a generic malware warning. This is a false positive. Tap **More details** -> **Install anyway**.
 
 *Alternative (ADB):* `adb install PristineCam.apk`
 
-### 💻 PC Client (`PristineCam.exe` - Windows)
+### PC Client (`PristineCam.exe` - Windows)
 1. Ensure you have a virtual camera driver installed on your PC. The easiest way is to install [OBS Studio](https://obsproject.com/), which provides the necessary driver automatically.
 2. Download `PristineCam.exe` from the latest release.
 3. Double-click to run! (No installation wizard required).
@@ -69,6 +69,6 @@ If you prefer to compile PristineCam yourself:
 
 ---
 
-## 📝 License
+## License
 
 This project is entirely open-source and free, distributed under the [GPLv3 License](https://github.com/PolishDogge/PristineCam/blob/main/LICENSE.txt). See the [`LICENSE.txt`](LICENSE.txt) file in the repository for full details.
