@@ -38,3 +38,5 @@ Desktop.ini
 *.temp
 pristinecam_settings.json
 *.spec
+keys/
+release/
