@@ -19,6 +19,8 @@ android/local.properties
 android/captures/
 android/.cxx/
 android/.externalNativeBuild/
+android/app/release/
+android/app/debug/
 *.jks
 *.keystore
 .idea/
@@ -38,3 +40,7 @@ Desktop.ini
 *.temp
 pristinecam_settings.json
 *.spec
+keys/
+dev/
+release/*
+!release/buildall.py

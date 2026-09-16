@@ -27,18 +27,23 @@ Dependencies
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 import sys
 import threading
 import time
+import typing
 import urllib.request
 from collections import deque
 from pathlib import Path
 from typing import Optional
 
-import cv2
-import numpy as np
+if typing.TYPE_CHECKING:
+    import cv2
+    import numpy as np
+    import pyvirtualcam
+    from pyvirtualcam import PixelFormat
 
 try:
     from PyQt6.QtCore import (
@@ -55,12 +60,8 @@ except ImportError:
     print("ERROR: PyQt6 not installed.\n  pip install PyQt6")
     sys.exit(1)
 
-try:
-    import pyvirtualcam
-    from pyvirtualcam import PixelFormat
-    HAS_VCAM = True
-except ImportError:
-    HAS_VCAM = False
+# Lightweight check to see if pyvirtualcam is installed without actually importing it
+HAS_VCAM = importlib.util.find_spec("pyvirtualcam") is not None
 
 try:
     from zeroconf_discovery import DiscoveryWorker, is_available as _zc_available
@@ -85,6 +86,7 @@ MAX_EMPTY_STREAK    = 45         # frames
 FPS_WINDOW_SIZE     = 60         # frames for moving average
 LATENCY_GOOD_MS     = 80
 LATENCY_WARN_MS     = 250
+BATTERY_TIMER       = 30000      # ms
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration & Paths
@@ -260,8 +262,11 @@ class StreamWorker(QObject):
     # ── Capture thread ────────────────────────────────────────────────────
 
     def _capture_loop(self) -> None:
+        import cv2
+        import numpy as np
+
         reconnect_delay = 1.0
-        cap: Optional[cv2.VideoCapture] = None
+        cap = None
         empty_streak = 0
 
         while self._running:
@@ -269,45 +274,49 @@ class StreamWorker(QObject):
                 self.status_changed.emit("connecting")
                 cap = cv2.VideoCapture(self._url, cv2.CAP_FFMPEG)
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                cap.set(cv2.CAP_PROP_FOURCC,
-                        cv2.VideoWriter.fourcc(*"MJPG"))
-
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                
                 if not cap.isOpened():
                     cap.release()
                     cap = None
-                    self.status_changed.emit("error")
-                    time.sleep(reconnect_delay)
-                    reconnect_delay = min(reconnect_delay * 2, 16.0)
+                    if self._running:
+                        self.status_changed.emit("error")
+                        time.sleep(reconnect_delay)
+                        reconnect_delay = min(reconnect_delay * 2, 16.0)
                     continue
-
+                    
                 self.status_changed.emit("connected")
                 reconnect_delay = 1.0
                 empty_streak = 0
-
+                
             t0 = time.perf_counter()
             ok, frame = cap.read()
             t1 = time.perf_counter()
-
+            
             if not ok or frame is None:
                 empty_streak += 1
-                if empty_streak >= MAX_EMPTY_STREAK:
+                if empty_streak > 30:  # ~1-2 seconds of dead stream
                     cap.release()
                     cap = None
-                    self.status_changed.emit("reconnecting")
                 continue
-
+                
             empty_streak = 0
             self._latest_frame = frame
             self._capture_latency = (t1 - t0) * 1000.0
             self._frame_event.set()  # wake the consumer
-
-        if cap:
+            
+        if cap is not None:
             cap.release()
 
     # ── Consumer loop (QThread) ───────────────────────────────────────────
 
     @pyqtSlot()
     def run(self) -> None:
+        import cv2
+        if HAS_VCAM:
+            import pyvirtualcam
+            from pyvirtualcam import PixelFormat
+
         self._running = True
 
         cam                       = None
@@ -436,17 +445,24 @@ class StreamWorker(QObject):
     # ── Transform helper ──────────────────────────────────────────────────
 
     def _apply_transforms(self, frame: np.ndarray) -> np.ndarray:
+        import numpy as np
+
         if self.mirror_h:
-            frame = cv2.flip(frame, 1)
+            frame = frame[:, ::-1, :]
         if self.mirror_v:
-            frame = cv2.flip(frame, 0)
+            frame = frame[::-1, :, :]
+            
         r = self.rotation
         if r == 90:
-            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+            frame = np.rot90(frame, k=-1)
         elif r == 180:
-            frame = cv2.rotate(frame, cv2.ROTATE_180)
+            frame = np.rot90(frame, k=-2)
         elif r == 270:
-            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            frame = np.rot90(frame, k=1)
+            
+        if not frame.flags.c_contiguous:
+            frame = np.ascontiguousarray(frame)
+            
         return frame
 
 
@@ -622,6 +638,10 @@ class SettingsDialog(QDialog):
         self.stats_chk.setToolTip("Toggle visibility of FPS, Latency, and Resolution.")
         form.addRow("", self.stats_chk)
 
+        self.ipv6_chk = QCheckBox("Show IPv6 connections")
+        self.ipv6_chk.setToolTip("Include IPv6 addresses in discovered devices list.")
+        form.addRow("", self.ipv6_chk)
+
         lay.addLayout(form)
 
         bbox = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -640,6 +660,7 @@ class SettingsDialog(QDialog):
 
         self.backend_cb.setCurrentIndex(cfg.get("backend_idx", 0))
         self.stats_chk.setChecked(cfg.get("show_stats", False))
+        self.ipv6_chk.setChecked(cfg.get("show_ipv6", False))
 
     def accept(self):
         fps_val = [5, 10, 15, 30][self.fps_cb.currentIndex()]
@@ -650,6 +671,7 @@ class SettingsDialog(QDialog):
 
         self.cfg["backend_idx"] = self.backend_cb.currentIndex()
         self.cfg["show_stats"] = self.stats_chk.isChecked()
+        self.cfg["show_ipv6"] = self.ipv6_chk.isChecked()
         super().accept()
 
 
@@ -673,7 +695,7 @@ class MainWindow(QMainWindow):
         # Battery polling — fires every 30 s while connected
         self._status_url: str = ""
         self._battery_timer = QTimer(self)
-        self._battery_timer.setInterval(30_000)
+        self._battery_timer.setInterval(BATTERY_TIMER)
         self._battery_timer.timeout.connect(self._poll_battery)
 
         self._build_ui()
@@ -901,7 +923,8 @@ class MainWindow(QMainWindow):
                 charging = bool(data.get("charging", False))
                 if worker is self._worker:   # still the same session
                     worker.battery_updated.emit(level, charging)
-            except Exception:
+            except Exception as exc:
+                print(f"Connection failed: {exc}")
                 pass  # silently ignore network errors during poll
 
         threading.Thread(target=_fetch, daemon=True, name="pristinecam-battery").start()
@@ -968,17 +991,28 @@ class MainWindow(QMainWindow):
     def _refresh_device_dropdown(self) -> None:
         if not HAS_ZEROCONF:
             return
+            
+        show_ipv6 = self._cfg.get("show_ipv6", False)
+        
         cb = self._discover_cb
         cb.blockSignals(True)
         cb.clear()
+        
+        added = 0
         if self._discovered:
             for name, (host, port) in self._discovered.items():
-                # Show short label — strip the service-type suffix for readability
+                if not show_ipv6 and ":" in host:
+                    continue
+                    
+                # Show short label
                 short = name.replace("._pristinecam._tcp.local.", "")
-                label = f"{short}  ({host}:{port})"
+                short = short.split(" [")[0]
+                label = f"{short} ({host})"
                 cb.addItem(label, (host, port))
+                added += 1
+                
             cb.setCurrentIndex(-1)   # nothing pre-selected
-            cb.setVisible(True)
+            cb.setVisible(added > 0)
         else:
             cb.setVisible(False)
         cb.blockSignals(False)
@@ -1005,6 +1039,7 @@ class MainWindow(QMainWindow):
             self._persist_settings()
             self._apply_settings_to_worker()
             self._apply_stats_visibility()
+            self._refresh_device_dropdown()
 
     def _apply_settings_to_worker(self) -> None:
         if not self._worker:
@@ -1040,6 +1075,10 @@ class MainWindow(QMainWindow):
     def _stream_url(self) -> str:
         ip   = "127.0.0.1" if self._usb.isChecked() else (
                self._ip.text().strip() or "192.168.1.100")
+               
+        if ":" in ip and not ip.startswith("["):
+            ip = f"[{ip}]"
+            
         port = self._port.text().strip() or "8080"
         return f"http://{ip}:{port}/video_feed"
 

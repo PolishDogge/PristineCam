@@ -16,6 +16,7 @@ object NetworkUtils {
         NetworkInterface.getNetworkInterfaces()
             ?.asSequence()
             ?.filter { iface -> iface.isUp && !iface.isLoopback }
+            ?.sortedByDescending { it.name.startsWith("wlan") || it.name.startsWith("rndis") || it.name.startsWith("usb") }
             ?.flatMap { iface ->
                 iface.inetAddresses.asSequence().filter { addr ->
                     !addr.isLoopbackAddress

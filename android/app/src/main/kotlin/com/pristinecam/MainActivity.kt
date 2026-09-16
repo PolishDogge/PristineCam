@@ -125,7 +125,6 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
-        service?.attachPreview(null)
         super.onStop()
     }
 
