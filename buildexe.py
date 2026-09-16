@@ -2,7 +2,7 @@ import PyInstaller.__main__
 import os
 
 PyInstaller.__main__.run([
-    'gui_client.py',
+    'changed_gui.py',
     '--onefile',
     '--windowed',
     '--icon=assets/icon.ico',

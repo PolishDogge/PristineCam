@@ -4,6 +4,7 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.os.BatteryManager
 import android.content.Intent
 import android.graphics.ImageFormat
 import android.graphics.Rect
@@ -112,7 +113,7 @@ class StreamingService : LifecycleService() {
 
     // ── HTTP server ───────────────────────────────────────────────────────────
 
-    private val mjpegServer = MjpegServer(DEFAULT_PORT)
+    private var mjpegServer = MjpegServer(DEFAULT_PORT)
     var jpegQuality: Int = DEFAULT_QUALITY
 
     // ── Wake lock ─────────────────────────────────────────────────────────────
@@ -174,11 +175,58 @@ class StreamingService : LifecycleService() {
             mainHandler.post { stopStreamingAndSelf() }
         }
 
-        mjpegServer.start()
-        registerNsd()
+        // Supply battery level and charging state to the /status endpoint.
+        val bm = getSystemService(BATTERY_SERVICE) as BatteryManager
+        mjpegServer.batteryProvider = {
+            val level    = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+            val charging = if (Build.VERSION.SDK_INT >= 28) {
+                bm.isCharging
+            } else {
+                val intent = registerReceiver(null, android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))
+                val status = intent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+                status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL
+            }
+            Pair(level, charging)
+        }
+
+        var started = false
+        var currentPort = DEFAULT_PORT
+        // Try up to 10 different ports if 8080 is in use
+        for (p in DEFAULT_PORT..DEFAULT_PORT+10) {
+            try {
+                mjpegServer = MjpegServer(p)
+                mjpegServer.onAllClientsDisconnected = {
+                    mainHandler.post { stopStreamingAndSelf() }
+                }
+                mjpegServer.batteryProvider = {
+                    val bm = getSystemService(BATTERY_SERVICE) as BatteryManager
+                    val level    = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+                    val charging = if (android.os.Build.VERSION.SDK_INT >= 28) {
+                        bm.isCharging
+                    } else {
+                        false // Simplified fallback
+                    }
+                    Pair(level, charging)
+                }
+                mjpegServer.start()
+                currentPort = p
+                started = true
+                break
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+        
+        if (!started) {
+            // Failed to bind to any port, abort streaming
+            _isStreaming.value = false
+            return
+        }
+        
+        registerNsd(currentPort)
         initCamera()
         _isStreaming.value = true
-        refreshStreamUrl()
+        refreshStreamUrl(currentPort)
 
         // Schedule OLED saver after 1 minute of streaming.
         mainHandler.postDelayed(screenSaverRunnable, SCREEN_SAVER_DELAY_MS)
@@ -192,6 +240,7 @@ class StreamingService : LifecycleService() {
         unregisterNsd()
         releaseCamera()
         mjpegServer.onAllClientsDisconnected = null  // prevent stale callbacks
+        mjpegServer.batteryProvider          = null
         mjpegServer.stop()
         releaseWakeLock()
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -442,11 +491,11 @@ class StreamingService : LifecycleService() {
 
     // ── NSD (mDNS) ────────────────────────────────────────────────────────────
 
-    private fun registerNsd() {
+    private fun registerNsd(activePort: Int = DEFAULT_PORT) {
         val serviceInfo = NsdServiceInfo().apply {
             serviceName = "PristineCam"
             serviceType = "_pristinecam._tcp."
-            port = DEFAULT_PORT
+            port = activePort
         }
         val listener = object : NsdManager.RegistrationListener {
             override fun onServiceRegistered(info: NsdServiceInfo) {}
@@ -501,9 +550,9 @@ class StreamingService : LifecycleService() {
         startForeground(NOTIF_ID, notification)
     }
 
-    private fun refreshStreamUrl() {
+    private fun refreshStreamUrl(activePort: Int = DEFAULT_PORT) {
         val ip = NetworkUtils.getLocalIpAddress() ?: "?.?.?.?"
-        _streamUrl.value = "http://$ip:$DEFAULT_PORT/video_feed"
+        _streamUrl.value = "http://$ip:$activePort/video_feed"
     }
 
     // ── Resolution presets ────────────────────────────────────────────────────

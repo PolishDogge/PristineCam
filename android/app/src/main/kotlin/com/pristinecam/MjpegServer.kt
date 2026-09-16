@@ -14,6 +14,7 @@ import java.util.concurrent.atomic.AtomicReference
  * Endpoints:
  *   GET /           → simple HTML page that embeds the stream in an <img> tag
  *   GET /video_feed → multipart/x-mixed-replace MJPEG stream
+ *   GET /status     → JSON: {"battery":<0-100>,"charging":<bool>}
  *
  * Thread safety:
  *   [pushFrame] may be called from any thread (e.g. CameraX analysis executor).
@@ -43,6 +44,12 @@ class MjpegServer(port: Int) : NanoHTTPD(port) {
      */
     var onAllClientsDisconnected: (() -> Unit)? = null
 
+    /**
+     * Called on each GET /status request to read the current battery level
+     * (0–100) and charging state. Set by StreamingService after construction.
+     */
+    var batteryProvider: (() -> Pair<Int, Boolean>)? = null
+
     /** Grace-period timer thread — cancelled if a new client connects. */
     @Volatile
     private var graceTimer: Thread? = null
@@ -58,11 +65,19 @@ class MjpegServer(port: Int) : NanoHTTPD(port) {
     override fun serve(session: IHTTPSession): Response {
         return when (session.uri) {
             "/video_feed" -> serveMjpegStream()
+            "/status"     -> serveStatus()
             "/"           -> serveIndexPage()
             else          -> newFixedLengthResponse(
                 Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Not found"
             )
         }
+    }
+
+    private fun serveStatus(): Response {
+        val (level, charging) = batteryProvider?.invoke() ?: Pair(-1, false)
+        val json = """{"battery":$level,"charging":$charging}"""
+        return newFixedLengthResponse(Response.Status.OK, "application/json", json)
+            .also { it.addHeader("Cache-Control", "no-cache") }
     }
 
     private fun serveIndexPage(): Response = newFixedLengthResponse(

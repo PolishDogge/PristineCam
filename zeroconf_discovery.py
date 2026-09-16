@@ -94,10 +94,9 @@ if _HAS_QT:
             try:
                 info = zc.get_service_info(stype, name, timeout=3000)
                 if info and info.addresses:
-                    host = socket.inet_ntoa(info.addresses[0])
-                    # pyqtSignal.emit() is thread-safe and uses Qt's queued
-                    # connection to deliver on the main thread.
-                    self.device_found.emit(host, info.port, name)
+                    for host in info.parsed_addresses():
+                        # Emit a separate dropdown entry for EACH IP so the user can pick the correct network interface
+                        self.device_found.emit(host, info.port, f"{name} [{host}]")
             except Exception:
                 pass
 
