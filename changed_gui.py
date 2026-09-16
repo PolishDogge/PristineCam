@@ -638,6 +638,10 @@ class SettingsDialog(QDialog):
         self.stats_chk.setToolTip("Toggle visibility of FPS, Latency, and Resolution.")
         form.addRow("", self.stats_chk)
 
+        self.ipv6_chk = QCheckBox("Show IPv6 connections")
+        self.ipv6_chk.setToolTip("Include IPv6 addresses in discovered devices list.")
+        form.addRow("", self.ipv6_chk)
+
         lay.addLayout(form)
 
         bbox = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -656,6 +660,7 @@ class SettingsDialog(QDialog):
 
         self.backend_cb.setCurrentIndex(cfg.get("backend_idx", 0))
         self.stats_chk.setChecked(cfg.get("show_stats", False))
+        self.ipv6_chk.setChecked(cfg.get("show_ipv6", False))
 
     def accept(self):
         fps_val = [5, 10, 15, 30][self.fps_cb.currentIndex()]
@@ -666,6 +671,7 @@ class SettingsDialog(QDialog):
 
         self.cfg["backend_idx"] = self.backend_cb.currentIndex()
         self.cfg["show_stats"] = self.stats_chk.isChecked()
+        self.cfg["show_ipv6"] = self.ipv6_chk.isChecked()
         super().accept()
 
 
@@ -985,17 +991,28 @@ class MainWindow(QMainWindow):
     def _refresh_device_dropdown(self) -> None:
         if not HAS_ZEROCONF:
             return
+            
+        show_ipv6 = self._cfg.get("show_ipv6", False)
+        
         cb = self._discover_cb
         cb.blockSignals(True)
         cb.clear()
+        
+        added = 0
         if self._discovered:
             for name, (host, port) in self._discovered.items():
-                # Show short label — strip the service-type suffix for readability
+                if not show_ipv6 and ":" in host:
+                    continue
+                    
+                # Show short label
                 short = name.replace("._pristinecam._tcp.local.", "")
-                label = f"{short}  ({host}:{port})"
+                short = short.split(" [")[0]
+                label = f"{short} ({host})"
                 cb.addItem(label, (host, port))
+                added += 1
+                
             cb.setCurrentIndex(-1)   # nothing pre-selected
-            cb.setVisible(True)
+            cb.setVisible(added > 0)
         else:
             cb.setVisible(False)
         cb.blockSignals(False)
@@ -1022,6 +1039,7 @@ class MainWindow(QMainWindow):
             self._persist_settings()
             self._apply_settings_to_worker()
             self._apply_stats_visibility()
+            self._refresh_device_dropdown()
 
     def _apply_settings_to_worker(self) -> None:
         if not self._worker:
