@@ -18,6 +18,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.util.Range
 import android.util.Size
 import androidx.camera.camera2.interop.Camera2CameraControl
 import androidx.camera.camera2.interop.CaptureRequestOptions
@@ -82,6 +83,19 @@ class StreamingService : LifecycleService() {
     private val _resolution = MutableStateFlow(StreamResolution.RES_720P)
     val resolution: StateFlow<StreamResolution> = _resolution.asStateFlow()
 
+    /** Target framerate preset (30 or 60 FPS), observable by the UI. */
+    private val _targetFps = MutableStateFlow(30)
+    val targetFps: StateFlow<Int> = _targetFps.asStateFlow()
+
+    fun setTargetFps(fps: Int) {
+        if (fps == _targetFps.value) return
+        _targetFps.value = fps
+        if (_isStreaming.value) {
+            ensureH264Encoder()
+            rebindCamera()
+        }
+    }
+
     /** OLED saver — true = pure black overlay + brightness 0. Auto-set after 1 min of streaming. */
     private val _isScreenSaverActive = MutableStateFlow(false)
     val isScreenSaverActive: StateFlow<Boolean> = _isScreenSaverActive.asStateFlow()
@@ -115,6 +129,10 @@ class StreamingService : LifecycleService() {
 
     private var mjpegServer = MjpegServer(DEFAULT_PORT)
     var jpegQuality: Int = DEFAULT_QUALITY
+
+    // ── H.264 All-Intra Encoder & MPEG-TS Muxer ──────────────────────────────
+    private var h264Encoder: H264Encoder? = null
+    private val tsMuxer = TsMuxer()
 
     // ── Wake lock ─────────────────────────────────────────────────────────────
 
@@ -199,10 +217,10 @@ class StreamingService : LifecycleService() {
                     mainHandler.post { stopStreamingAndSelf() }
                 }
                 mjpegServer.batteryProvider = {
-                    val bm = getSystemService(BATTERY_SERVICE) as BatteryManager
-                    val level    = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+                    val batteryMgr = getSystemService(BATTERY_SERVICE) as BatteryManager
+                    val level    = batteryMgr.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
                     val charging = if (android.os.Build.VERSION.SDK_INT >= 28) {
-                        bm.isCharging
+                        batteryMgr.isCharging
                     } else {
                         false // Simplified fallback
                     }
@@ -224,6 +242,10 @@ class StreamingService : LifecycleService() {
         }
         
         registerNsd(currentPort)
+        mjpegServer.onH264ClientConnected = {
+            h264Encoder?.requestKeyFrame()
+        }
+        ensureH264Encoder()
         initCamera()
         _isStreaming.value = true
         refreshStreamUrl(currentPort)
@@ -239,7 +261,10 @@ class StreamingService : LifecycleService() {
         _isScreenSaverActive.value = false
         unregisterNsd()
         releaseCamera()
+        h264Encoder?.release()
+        h264Encoder = null
         mjpegServer.onAllClientsDisconnected = null  // prevent stale callbacks
+        mjpegServer.onH264ClientConnected    = null
         mjpegServer.batteryProvider          = null
         mjpegServer.stop()
         releaseWakeLock()
@@ -285,6 +310,7 @@ class StreamingService : LifecycleService() {
         if (res == _resolution.value) return
         _resolution.value = res
         if (_isStreaming.value) {
+            ensureH264Encoder()
             imageAnalysis = buildImageAnalysis()
             rebindCamera()
         }
@@ -388,6 +414,14 @@ class StreamingService : LifecycleService() {
         if (useCases.isNotEmpty()) {
             runCatching {
                 camera = provider.bindToLifecycle(this, cameraSelector, *useCases.toTypedArray())
+                camera?.cameraControl?.let { ctrl ->
+                    val cam2 = Camera2CameraControl.from(ctrl)
+                    val fps = _targetFps.value
+                    val range = if (fps >= 60) Range(60, 60) else Range(30, 30)
+                    cam2.captureRequestOptions = CaptureRequestOptions.Builder()
+                        .setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
+                        .build()
+                }
             }
         }
     }
@@ -406,8 +440,8 @@ class StreamingService : LifecycleService() {
     private val reusableOutStream = ByteArrayOutputStream(1024 * 1024)
 
     /**
-     * Convert YUV_420_888 → NV21 → JPEG on the dedicated analysis executor,
-     * then push the compressed bytes into the MjpegServer's AtomicReference.
+     * Convert YUV_420_888 → NV21 → H.264 (hardware) / JPEG (fallback)
+     * on the dedicated analysis executor, pushing compressed packets to MjpegServer.
      */
     private fun encodeAndPush(proxy: ImageProxy) {
         try {
@@ -418,12 +452,42 @@ class StreamingService : LifecycleService() {
                 reusableNv21 = ByteArray(expectedSize)
             }
             yuvToNv21(proxy, reusableNv21)
+
+            ensureH264Encoder(width, height)
+
+            val ptsUs = proxy.imageInfo.timestamp / 1000L
+
+            // Feed hardware H.264 All-Intra encoder
+            h264Encoder?.encodeFrame(reusableNv21, ptsUs)
+
+            // Feed MJPEG fallback
             val yuvImg = YuvImage(reusableNv21, ImageFormat.NV21, width, height, null)
             reusableOutStream.reset()
             yuvImg.compressToJpeg(Rect(0, 0, width, height), jpegQuality, reusableOutStream)
             mjpegServer.pushFrame(reusableOutStream.toByteArray())
         } finally {
             proxy.close()
+        }
+    }
+
+    private fun ensureH264Encoder(
+        w: Int = _resolution.value.size.width,
+        h: Int = _resolution.value.size.height
+    ) {
+        val fps = _targetFps.value
+        val bitrate = when {
+            h >= 1080 || w >= 1080 -> if (fps >= 60) 10_000_000 else 6_000_000
+            h >= 720  || w >= 720  -> if (fps >= 60) 6_000_000 else 3_500_000
+            else                   -> if (fps >= 60) 3_000_000 else 2_000_000
+        }
+
+        if (h264Encoder == null || h264Encoder?.width != w || h264Encoder?.height != h || h264Encoder?.fps != fps) {
+            h264Encoder?.release()
+            h264Encoder = H264Encoder(w, h, fps, bitrate) { nalBytes, isKey ->
+                val ptsUs = System.nanoTime() / 1000L
+                val tsPacket = tsMuxer.muxNal(nalBytes, ptsUs, isKey)
+                mjpegServer.pushH264Ts(tsPacket)
+            }
         }
     }
 
@@ -479,7 +543,6 @@ class StreamingService : LifecycleService() {
 
     private fun acquireWakeLock() {
         val pm = getSystemService(POWER_SERVICE) as PowerManager
-        @Suppress("WakelockTimeout")
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKELOCK_TAG)
             .apply { acquire(MAX_STREAM_MS) }
     }

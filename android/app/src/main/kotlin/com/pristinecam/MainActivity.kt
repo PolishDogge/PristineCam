@@ -167,6 +167,7 @@ private fun MainScreen(service: StreamingService, activity: ComponentActivity) {
     val isStreaming       by service.isStreaming.collectAsStateWithLifecycle()
     val streamUrl         by service.streamUrl.collectAsStateWithLifecycle()
     val currentRes        by service.resolution.collectAsStateWithLifecycle()
+    val targetFps         by service.targetFps.collectAsStateWithLifecycle()
     val screenSaverActive by service.isScreenSaverActive.collectAsStateWithLifecycle()
     val torchEnabled      by service.torchEnabled.collectAsStateWithLifecycle()
     val exposureIndex     by service.exposureIndex.collectAsStateWithLifecycle()
@@ -523,8 +524,10 @@ private fun MainScreen(service: StreamingService, activity: ComponentActivity) {
         ) {
             OptionsSheet(
                 currentRes          = currentRes,
+                targetFps           = targetFps,
                 showCameraControls  = showCameraControls,
                 onResolutionChange  = { service.setResolution(it) },
+                onFpsChange         = { service.setTargetFps(it) },
                 onCameraControlsToggle = { showCameraControls = it },
                 onDismiss           = { showOptions = false }
             )
@@ -537,8 +540,10 @@ private fun MainScreen(service: StreamingService, activity: ComponentActivity) {
 @Composable
 private fun OptionsSheet(
     currentRes: StreamingService.StreamResolution,
+    targetFps: Int,
     showCameraControls: Boolean,
     onResolutionChange: (StreamingService.StreamResolution) -> Unit,
+    onFpsChange: (Int) -> Unit,
     onCameraControlsToggle: (Boolean) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -594,7 +599,7 @@ private fun OptionsSheet(
                                 MaterialTheme.colorScheme.onSurface
                         )
                         Text(
-                            text  = "${res.size.width}\u00d7${res.size.height} \u00b7 30 FPS",
+                            text  = "${res.size.width}\u00d7${res.size.height} \u00b7 $targetFps FPS",
                             style = MaterialTheme.typography.bodySmall,
                             color = if (selected)
                                 MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f)
@@ -616,6 +621,60 @@ private fun OptionsSheet(
                         }
                     }
                 }
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        // ── Target Framerate ─────────────────────────────────────────────
+        Text(
+            text  = "Framerate (FPS)",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.padding(bottom = 10.dp)
+        )
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            listOf(30 to "30 FPS", 60 to "60 FPS (Experimental)").forEach { (fps, label) ->
+                val selected = fps == targetFps
+                Surface(
+                    onClick = { onFpsChange(fps) },
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(12.dp),
+                    color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                    tonalElevation = if (selected) 2.dp else 0.dp
+                ) {
+                    Box(
+                        modifier = Modifier.padding(vertical = 12.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = label,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                            color = if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                }
+            }
+        }
+
+        if (targetFps == 60) {
+            Spacer(Modifier.height(8.dp))
+            Surface(
+                shape = RoundedCornerShape(10.dp),
+                color = MaterialTheme.colorScheme.tertiaryContainer,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = "⚠️ 60 FPS Advisory: Requires good lighting (shutter speed is halved). Best used over 5GHz Wi-Fi or USB cable mode.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onTertiaryContainer,
+                    modifier = Modifier.padding(12.dp)
+                )
             }
         }
 

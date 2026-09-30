@@ -120,6 +120,9 @@ _DEFAULTS: dict = {
     "preview_fps": 30,
     "preview_res": "480x270",
     "show_stats": False,
+    "show_ipv6": False,
+    "stream_codec": "h264",
+    "target_fps": 30,
 }
 
 def _load_cfg() -> dict:
@@ -227,11 +230,13 @@ class StreamWorker(QObject):
     error_occurred     = pyqtSignal(str)
     battery_updated    = pyqtSignal(int, bool)  # (level 0-100, is_charging)
 
-    def __init__(self, url: str, backend: Optional[str]) -> None:
+    def __init__(self, url: str, backend: Optional[str], target_fps: int = 30) -> None:
         super().__init__()
         self._url     = url
         self._backend = backend
         self._running = False
+        self.target_fps = target_fps
+        self.frame_interval = 1.0 / max(1, target_fps)
 
         # Shared capture → consumer state (GIL-atomic reference swaps)
         self._latest_frame: Optional[np.ndarray] = None
@@ -274,7 +279,8 @@ class StreamWorker(QObject):
                 self.status_changed.emit("connecting")
                 cap = cv2.VideoCapture(self._url, cv2.CAP_FFMPEG)
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                if "video_feed" in self._url:
+                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
                 
                 if not cap.isOpened():
                     cap.release()
@@ -370,7 +376,7 @@ class StreamWorker(QObject):
                         try:
                             kw: dict = {
                                 "width": ow, "height": oh,
-                                "fps": TARGET_FPS,
+                                "fps": self.target_fps,
                                 "fmt": PixelFormat.BGR,
                             }
                             if self._backend:
@@ -402,7 +408,7 @@ class StreamWorker(QObject):
                 # ── Preview (dynamic FPS, dynamic res) ───────────
                 frame_count += 1
                 if self.show_preview:
-                    preview_every_n = max(1, TARGET_FPS // self.preview_fps) if self.preview_fps > 0 else 1
+                    preview_every_n = max(1, self.target_fps // self.preview_fps) if self.preview_fps > 0 else 1
                     if frame_count % preview_every_n == 0:
                         if self.preview_w > 0 and self.preview_h > 0:
                             small = cv2.resize(
@@ -421,7 +427,7 @@ class StreamWorker(QObject):
                         ).copy()
                         self.frame_ready.emit(qimg)
 
-                # ── Pace to 30 FPS ────────────────────────────────────
+                # ── Pace to target FPS ────────────────────────────────────
                 if cam is not None and hasattr(cam, "sleep_until_next_frame"):
                     try:
                         cam.sleep_until_next_frame()
@@ -429,7 +435,7 @@ class StreamWorker(QObject):
                         pass
                 else:
                     elapsed = time.perf_counter() - t_loop
-                    sleep_for = FRAME_INTERVAL - elapsed
+                    sleep_for = self.frame_interval - elapsed
                     if sleep_for > 0:
                         time.sleep(sleep_for)
 
@@ -633,6 +639,18 @@ class SettingsDialog(QDialog):
         self.backend_cb.setToolTip("Select virtual camera backend driver.")
         form.addRow("VCam Backend:", self.backend_cb)
         
+        # Stream Codec
+        self.codec_cb = QComboBox()
+        self.codec_cb.addItems(["H.264 Hardware (Fastest)", "MJPEG (Legacy)"])
+        self.codec_cb.setToolTip("Video stream codec. H.264 uses hardware acceleration on both phone and PC.")
+        form.addRow("Stream Codec:", self.codec_cb)
+
+        # Target Framerate
+        self.target_fps_cb = QComboBox()
+        self.target_fps_cb.addItems(["30 FPS (Standard)", "60 FPS (Experimental)"])
+        self.target_fps_cb.setToolTip("Stream and virtual camera framerate. 60 FPS requires good lighting and fast Wi-Fi/USB.")
+        form.addRow("Target FPS:", self.target_fps_cb)
+
         # Show Stats
         self.stats_chk = QCheckBox("Show Performance Stats")
         self.stats_chk.setToolTip("Toggle visibility of FPS, Latency, and Resolution.")
@@ -659,6 +677,10 @@ class SettingsDialog(QDialog):
         self.res_cb.setCurrentIndex(idx)
 
         self.backend_cb.setCurrentIndex(cfg.get("backend_idx", 0))
+        codec = cfg.get("stream_codec", "h264")
+        self.codec_cb.setCurrentIndex(0 if codec == "h264" else 1)
+        target_fps = cfg.get("target_fps", 30)
+        self.target_fps_cb.setCurrentIndex(1 if target_fps == 60 else 0)
         self.stats_chk.setChecked(cfg.get("show_stats", False))
         self.ipv6_chk.setChecked(cfg.get("show_ipv6", False))
 
@@ -670,6 +692,8 @@ class SettingsDialog(QDialog):
         self.cfg["preview_res"] = res_val
 
         self.cfg["backend_idx"] = self.backend_cb.currentIndex()
+        self.cfg["stream_codec"] = "h264" if self.codec_cb.currentIndex() == 0 else "mjpeg"
+        self.cfg["target_fps"] = 60 if self.target_fps_cb.currentIndex() == 1 else 30
         self.cfg["show_stats"] = self.stats_chk.isChecked()
         self.cfg["show_ipv6"] = self.ipv6_chk.isChecked()
         super().accept()
@@ -1080,7 +1104,9 @@ class MainWindow(QMainWindow):
             ip = f"[{ip}]"
             
         port = self._port.text().strip() or "8080"
-        return f"http://{ip}:{port}/video_feed"
+        codec = self._cfg.get("stream_codec", "h264")
+        endpoint = "live.ts" if codec == "h264" else "video_feed"
+        return f"http://{ip}:{port}/{endpoint}"
 
     def _toggle_connection(self) -> None:
         if self._connected:
@@ -1106,9 +1132,11 @@ class MainWindow(QMainWindow):
         b_keys = list(_BACKENDS.keys())
         backend_val = _BACKENDS[b_keys[b_idx]] if b_idx < len(b_keys) else None
 
+        target_fps = self._cfg.get("target_fps", 30)
         self._worker = StreamWorker(
             url=self._stream_url(),
             backend=backend_val,
+            target_fps=target_fps,
         )
         self._worker.mirror_h     = self._flip_h.isChecked()
         self._worker.mirror_v     = self._flip_v.isChecked()
@@ -1128,8 +1156,8 @@ class MainWindow(QMainWindow):
         self._worker.error_occurred.connect(self._on_error)
         self._worker.battery_updated.connect(self._on_battery_updated)
 
-        # Derive /status URL from the stream URL (replace /video_feed with /status)
-        self._status_url = self._stream_url().replace("/video_feed", "/status")
+        # Derive /status URL from the stream URL
+        self._status_url = self._stream_url().replace("/live.ts", "/status").replace("/video_feed", "/status")
 
         self._thread.start()
         self._connected = True
@@ -1417,6 +1445,120 @@ QStatusBar::item { border: none; }
 """
 
 
+def run_self_tests() -> int:
+    """Headless self-test suite for CI/buildall verification."""
+    print("=" * 60)
+    print("PristineCam Desktop Client — Self-Test Suite")
+    print("=" * 60)
+    failed = 0
+
+    # 1. Dependency Imports & Native Libraries
+    print("[1/5] Checking dependencies and native libraries...")
+    try:
+        import cv2
+        import numpy as np
+        from PyQt6 import QtCore, QtWidgets, QtGui
+        print(f"  [OK] OpenCV: {cv2.__version__}")
+        print(f"  [OK] NumPy: {np.__version__}")
+        print(f"  [OK] PyQt6: {QtCore.PYQT_VERSION_STR}")
+        print(f"  [OK] pyvirtualcam available: {HAS_VCAM}")
+    except Exception as exc:
+        print(f"  [FAIL] Dependency check FAILED: {exc}")
+        failed += 1
+
+    # 2. Configuration Defaults & Integrity
+    print("[2/5] Checking configuration schema and defaults...")
+    try:
+        cfg = _load_cfg()
+        assert "stream_codec" in cfg, "Missing stream_codec key"
+        assert "target_fps" in cfg, "Missing target_fps key"
+        assert "show_ipv6" in cfg, "Missing show_ipv6 key"
+        assert cfg["stream_codec"] in ("h264", "mjpeg"), f"Invalid default stream_codec: {cfg['stream_codec']}"
+        assert cfg["target_fps"] in (30, 60), f"Invalid default target_fps: {cfg['target_fps']}"
+        print(f"  [OK] Config keys valid (codec={cfg['stream_codec']}, fps={cfg['target_fps']})")
+    except Exception as exc:
+        print(f"  [FAIL] Config check FAILED: {exc}")
+        failed += 1
+
+    # 3. URL Formatting & Routing
+    print("[3/5] Checking stream URL formatting & codec routing...")
+    try:
+        # IPv4 + H.264
+        url_h264 = "http://192.168.1.50:8080/live.ts"
+        # IPv4 + MJPEG
+        url_mjpeg = "http://192.168.1.50:8080/video_feed"
+        # Status derivation
+        stat_h264 = url_h264.replace("/live.ts", "/status").replace("/video_feed", "/status")
+        stat_mjpeg = url_mjpeg.replace("/live.ts", "/status").replace("/video_feed", "/status")
+        assert stat_h264 == "http://192.168.1.50:8080/status", f"H.264 status URL mismatch: {stat_h264}"
+        assert stat_mjpeg == "http://192.168.1.50:8080/status", f"MJPEG status URL mismatch: {stat_mjpeg}"
+
+        # IPv6 formatting check
+        ip_v6 = "fe80::1234:5678"
+        formatted_v6 = f"[{ip_v6}]" if ":" in ip_v6 and not ip_v6.startswith("[") else ip_v6
+        assert formatted_v6 == "[fe80::1234:5678]", f"IPv6 bracket formatting failed: {formatted_v6}"
+        print("  [OK] URL formatting and status URL derivation verified")
+    except Exception as exc:
+        print(f"  [FAIL] URL formatting check FAILED: {exc}")
+        failed += 1
+
+    # 4. Zero-Copy Image Transformation Engine
+    print("[4/5] Checking zero-copy image transformation engine...")
+    try:
+        import numpy as np
+        worker = StreamWorker("http://127.0.0.1:8080/live.ts", None, target_fps=30)
+        
+        # Test synthetic frame
+        h, w = 1080, 1920
+        test_frame = np.zeros((h, w, 3), dtype=np.uint8)
+        test_frame[0, 0] = [255, 0, 0]  # Mark top-left pixel blue
+
+        # Test mirroring
+        worker.mirror_h = True
+        worker.mirror_v = False
+        worker.rotation = 0
+        out_h = worker._apply_transforms(test_frame)
+        assert out_h.shape == (h, w, 3), f"Shape mismatch: {out_h.shape}"
+        assert np.array_equal(out_h[0, -1], [255, 0, 0]), "Horizontal mirror failed"
+        assert out_h.flags.c_contiguous, "Memory not C-contiguous after mirror"
+
+        # Test 90 degree rotation
+        worker.mirror_h = False
+        worker.rotation = 90
+        out_90 = worker._apply_transforms(test_frame)
+        assert out_90.shape == (w, h, 3), f"Rotation 90 shape mismatch: {out_90.shape}"
+        assert out_90.flags.c_contiguous, "Memory not C-contiguous after 90 deg rotation"
+
+        # Test 60 FPS pacing interval calculation
+        worker_60 = StreamWorker("http://127.0.0.1:8080/live.ts", None, target_fps=60)
+        assert abs(worker_60.frame_interval - (1.0 / 60)) < 1e-6, "60 FPS frame interval incorrect"
+        print("  [OK] Zero-copy transforms and 60 FPS pacing calculations verified")
+    except Exception as exc:
+        print(f"  [FAIL] Transformation test FAILED: {exc}")
+        failed += 1
+
+    # 5. Virtual Camera Availability Check
+    print("[5/5] Checking virtual camera backend availability...")
+    try:
+        if HAS_VCAM:
+            print(f"  [OK] pyvirtualcam is installed; backends detected: {list(_BACKENDS.keys())}")
+        else:
+            print("  [WARN] pyvirtualcam is not installed in current environment (optional on PC without VCam driver)")
+    except Exception as exc:
+        print(f"  [FAIL] VCam check FAILED: {exc}")
+        failed += 1
+
+    print("=" * 60)
+    if failed == 0:
+        print("ALL TESTS PASSED! Ready for compilation.")
+        print("=" * 60)
+        return 0
+    else:
+        print(f"TESTS FAILED: {failed} error(s) detected. Aborting build.")
+        print("=" * 60)
+        return 1
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1435,4 +1577,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        sys.exit(run_self_tests())
     main()

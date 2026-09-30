@@ -34,7 +34,10 @@ class MjpegServer(port: Int) : NanoHTTPD(port) {
     private val latestJpeg   = AtomicReference<ByteArray?>(null)
     private val frameVersion = AtomicLong(0L)
 
-    /** Number of clients currently receiving the MJPEG stream. */
+    private val latestH264Ts = AtomicReference<ByteArray?>(null)
+    private val h264Version  = AtomicLong(0L)
+
+    /** Number of clients currently receiving the stream. */
     val activeClients = AtomicInteger(0)
 
     /**
@@ -43,6 +46,11 @@ class MjpegServer(port: Int) : NanoHTTPD(port) {
      * Set this before calling [start].
      */
     var onAllClientsDisconnected: (() -> Unit)? = null
+
+    /**
+     * Called when a client connects to the /live.ts H.264 stream.
+     */
+    var onH264ClientConnected: (() -> Unit)? = null
 
     /**
      * Called on each GET /status request to read the current battery level
@@ -60,10 +68,17 @@ class MjpegServer(port: Int) : NanoHTTPD(port) {
         frameVersion.incrementAndGet()
     }
 
+    /** Push encoded MPEG-TS chunk to connected /live.ts clients. */
+    fun pushH264Ts(tsChunk: ByteArray) {
+        latestH264Ts.set(tsChunk)
+        h264Version.incrementAndGet()
+    }
+
     // ── Request routing ───────────────────────────────────────────────────────
 
     override fun serve(session: IHTTPSession): Response {
         return when (session.uri) {
+            "/live.ts"    -> serveH264Stream()
             "/video_feed" -> serveMjpegStream()
             "/status"     -> serveStatus()
             "/"           -> serveIndexPage()
@@ -91,6 +106,54 @@ class MjpegServer(port: Int) : NanoHTTPD(port) {
            |<body><img src="/video_feed" alt="PristineCam stream"/></body>
            |</html>""".trimMargin()
     )
+
+    // ── H.264 MPEG-TS streaming ────────────────────────────────────────────────
+
+    private fun serveH264Stream(): Response {
+        val pipedOut = PipedOutputStream()
+        val pipedIn  = PipedInputStream(pipedOut, PIPE_BUFFER_BYTES)
+
+        cancelGraceTimer()
+        activeClients.incrementAndGet()
+        onH264ClientConnected?.invoke()
+
+        Thread({
+            try {
+                var lastVersion = -1L
+                while (true) {
+                    val current = h264Version.get()
+                    if (current != lastVersion) {
+                        lastVersion = current
+                        val tsData = latestH264Ts.get() ?: run {
+                            Thread.sleep(POLL_INTERVAL_MS)
+                            return@run null
+                        } ?: continue
+
+                        pipedOut.write(tsData)
+                        pipedOut.flush()
+                    } else {
+                        Thread.sleep(POLL_INTERVAL_MS)
+                    }
+                }
+            } catch (_: IOException) {
+                // Client disconnected — socket closed or pipe broken.
+            } catch (_: InterruptedException) {
+                // Service shutdown.
+            } finally {
+                runCatching { pipedOut.close() }
+                onClientDisconnected()
+            }
+        }, "pristinecam-h264-${activeClients.get()}").also { it.isDaemon = true }.start()
+
+        return newChunkedResponse(
+            Response.Status.OK,
+            "video/mp2t",
+            pipedIn
+        ).also {
+            it.addHeader("Cache-Control", "no-cache")
+            it.addHeader("Connection", "close")
+        }
+    }
 
     // ── MJPEG streaming ───────────────────────────────────────────────────────
 
