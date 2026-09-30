@@ -1,10 +1,11 @@
-import PyInstaller.__main__
 import os
+import PyInstaller.__main__
 
 PyInstaller.__main__.run([
-    'changed_gui.py',
+    'pristinecam.py',
+    '--name=PristineCam',
     '--onefile',
     '--windowed',
     '--icon=assets/icon.ico',
-    f'--add-data=assets/icon.png{os.pathsep}assets'
+    f'--add-data=assets/icon.png{os.pathsep}assets',
 ])

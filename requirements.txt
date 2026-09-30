@@ -1,4 +1,5 @@
-opencv-python>=5.0.0
+opencv-python>=4.8.0
 pyvirtualcam>=0.15.0
 PyQt6>=6.6.0
 zeroconf>=0.131.0
+pyinstaller>=6.0.0

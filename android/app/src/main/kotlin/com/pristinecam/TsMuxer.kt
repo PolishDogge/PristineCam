@@ -158,17 +158,6 @@ class TsMuxer {
      * Includes PTS timestamp in the PES header.
      */
     fun muxNal(nalData: ByteArray, ptsUs: Long, isKeyFrame: Boolean): ByteArray {
-        val out = ByteArrayOutputStream()
-
-        // For keyframes (IDR / All-Intra) or periodically (~every 30 frames / 1s), emit PAT and PMT tables
-        if (isKeyFrame || framesSincePatPmt >= 30) {
-            out.write(createPat())
-            out.write(createPmt())
-            framesSincePatPmt = 0
-        } else {
-            framesSincePatPmt++
-        }
-
         // Build PES Header with PTS
         // 90 kHz timebase for MPEG-TS: pts90 = ptsUs * 90 / 1000
         val pts90 = (ptsUs * 90 / 1000) and 0x1FFFFFFFFL
@@ -195,56 +184,48 @@ class TsMuxer {
 
         // Total payload for this PES = pesHeader + nalData
         val totalPesLength = pesHeader.size + nalData.size
-        var bytesWritten = 0
 
+        // Pre-allocate buffer: (PAT + PMT + PES packets) * 188
+        val estimatedPackets = (totalPesLength + maxPayloadPerTs - 1) / maxPayloadPerTs + 4
+        val out = ByteArrayOutputStream(estimatedPackets * tsPacketSize)
+
+        // For keyframes (IDR / All-Intra) or periodically (~every 30 frames / 1s), emit PAT and PMT tables
+        if (isKeyFrame || framesSincePatPmt >= 30) {
+            out.write(createPat())
+            out.write(createPmt())
+            framesSincePatPmt = 0
+        } else {
+            framesSincePatPmt++
+        }
+
+        var bytesWritten = 0
         var isFirstPacket = true
+
         while (bytesWritten < totalPesLength) {
             val ts = ByteArray(tsPacketSize)
             val remaining = totalPesLength - bytesWritten
 
-            if (isFirstPacket) {
-                // First packet of PES
-                ts[0] = SYNC_BYTE
-                ts[1] = (0x40 or ((VIDEO_PID shr 8) and 0x1F)).toByte() // payload unit start indicator = 1
-                ts[2] = (VIDEO_PID and 0xFF).toByte()
+            ts[0] = SYNC_BYTE
+            val startIndicator = if (isFirstPacket) 0x40 else 0x00
+            ts[1] = (startIndicator or ((VIDEO_PID shr 8) and 0x1F)).toByte()
+            ts[2] = (VIDEO_PID and 0xFF).toByte()
 
-                if (remaining >= maxPayloadPerTs) {
-                    ts[3] = (0x10 or (videoCc and 0x0F)).toByte() // Payload only
-                    videoCc = (videoCc + 1) and 0x0F
-                    writePesSlice(ts, 4, maxPayloadPerTs, pesHeader, nalData, bytesWritten)
-                    bytesWritten += maxPayloadPerTs
-                } else {
-                    // Requires Adaptation Field for padding
-                    val padding = maxPayloadPerTs - remaining
-                    ts[3] = (0x30 or (videoCc and 0x0F)).toByte() // Adaptation + Payload
-                    videoCc = (videoCc + 1) and 0x0F
-                    writeAdaptationField(ts, 4, padding)
-                    writePesSlice(ts, 4 + padding, remaining, pesHeader, nalData, bytesWritten)
-                    bytesWritten += remaining
-                }
-                isFirstPacket = false
+            if (remaining >= maxPayloadPerTs) {
+                ts[3] = (0x10 or (videoCc and 0x0F)).toByte() // Payload only
+                videoCc = (videoCc + 1) and 0x0F
+                writePesSlice(ts, 4, maxPayloadPerTs, pesHeader, nalData, bytesWritten)
+                bytesWritten += maxPayloadPerTs
             } else {
-                // Continuation packets
-                ts[0] = SYNC_BYTE
-                ts[1] = ((VIDEO_PID shr 8) and 0x1F).toByte() // payload unit start indicator = 0
-                ts[2] = (VIDEO_PID and 0xFF).toByte()
-
-                if (remaining >= maxPayloadPerTs) {
-                    ts[3] = (0x10 or (videoCc and 0x0F)).toByte() // Payload only
-                    videoCc = (videoCc + 1) and 0x0F
-                    writePesSlice(ts, 4, maxPayloadPerTs, pesHeader, nalData, bytesWritten)
-                    bytesWritten += maxPayloadPerTs
-                } else {
-                    // Final packet: pad with adaptation field
-                    val padding = maxPayloadPerTs - remaining
-                    ts[3] = (0x30 or (videoCc and 0x0F)).toByte() // Adaptation + Payload
-                    videoCc = (videoCc + 1) and 0x0F
-                    writeAdaptationField(ts, 4, padding)
-                    writePesSlice(ts, 4 + padding, remaining, pesHeader, nalData, bytesWritten)
-                    bytesWritten += remaining
-                }
+                // Requires Adaptation Field for padding
+                val padding = maxPayloadPerTs - remaining
+                ts[3] = (0x30 or (videoCc and 0x0F)).toByte() // Adaptation + Payload
+                videoCc = (videoCc + 1) and 0x0F
+                writeAdaptationField(ts, 4, padding)
+                writePesSlice(ts, 4 + padding, remaining, pesHeader, nalData, bytesWritten)
+                bytesWritten += remaining
             }
 
+            isFirstPacket = false
             out.write(ts)
         }
 
@@ -275,7 +256,7 @@ class TsMuxer {
 
         // If part of header still needs to be written
         if (currentSrc < header.size) {
-            val toCopy = Math.min(len - written, header.size - currentSrc)
+            val toCopy = minOf(len - written, header.size - currentSrc)
             System.arraycopy(header, currentSrc, dest, destOffset + written, toCopy)
             written += toCopy
             currentSrc += toCopy

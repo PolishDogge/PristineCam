@@ -74,8 +74,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.zIndex
 import kotlin.OptIn
-import androidx.annotation.OptIn as AndroidXOptIn
-import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -124,10 +122,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    override fun onStop() {
-        super.onStop()
-    }
-
     override fun onDestroy() {
         if (serviceBound) {
             service?.attachPreview(null)
@@ -161,7 +155,6 @@ class MainActivity : ComponentActivity() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 @OptIn(ExperimentalMaterial3Api::class)
-@AndroidXOptIn(ExperimentalCamera2Interop::class)
 @Composable
 private fun MainScreen(service: StreamingService, activity: ComponentActivity) {
     val isStreaming       by service.isStreaming.collectAsStateWithLifecycle()

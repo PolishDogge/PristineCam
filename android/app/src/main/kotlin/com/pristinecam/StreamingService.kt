@@ -185,61 +185,50 @@ class StreamingService : LifecycleService() {
     fun startStreaming() {
         if (_isStreaming.value) return
         acquireWakeLock()
-        postForegroundNotification()
-
-        // Auto-shutdown: when the last PC client disconnects and no new client
-        // reconnects within 5 seconds, stop everything automatically.
-        mjpegServer.onAllClientsDisconnected = {
-            mainHandler.post { stopStreamingAndSelf() }
-        }
-
-        // Supply battery level and charging state to the /status endpoint.
-        val bm = getSystemService(BATTERY_SERVICE) as BatteryManager
-        mjpegServer.batteryProvider = {
-            val level    = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
-            val charging = if (Build.VERSION.SDK_INT >= 28) {
-                bm.isCharging
-            } else {
-                val intent = registerReceiver(null, android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))
-                val status = intent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
-                status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL
-            }
-            Pair(level, charging)
-        }
+        postForegroundNotification(DEFAULT_PORT)
 
         var started = false
         var currentPort = DEFAULT_PORT
         // Try up to 10 different ports if 8080 is in use
-        for (p in DEFAULT_PORT..DEFAULT_PORT+10) {
+        for (p in DEFAULT_PORT..DEFAULT_PORT + 10) {
             try {
-                mjpegServer = MjpegServer(p)
-                mjpegServer.onAllClientsDisconnected = {
+                val server = MjpegServer(p)
+                server.onAllClientsDisconnected = {
                     mainHandler.post { stopStreamingAndSelf() }
                 }
-                mjpegServer.batteryProvider = {
-                    val batteryMgr = getSystemService(BATTERY_SERVICE) as BatteryManager
-                    val level    = batteryMgr.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
-                    val charging = if (android.os.Build.VERSION.SDK_INT >= 28) {
-                        batteryMgr.isCharging
-                    } else {
-                        false // Simplified fallback
-                    }
-                    Pair(level, charging)
+                server.statusProvider = {
+                    val (level, charging) = readBatteryStatus()
+                    val res = _resolution.value.size
+                    MjpegServer.StreamStatus(
+                        battery = level,
+                        charging = charging,
+                        fps = _targetFps.value,
+                        width = res.width,
+                        height = res.height,
+                        codec = "h264"
+                    )
                 }
-                mjpegServer.start()
+                server.batteryProvider = { readBatteryStatus() }
+                server.start()
+                mjpegServer = server
                 currentPort = p
                 started = true
                 break
-            } catch (e: Exception) {
-                e.printStackTrace()
+            } catch (_: Exception) {
+                // Port in use, retry next port
             }
         }
         
         if (!started) {
             // Failed to bind to any port, abort streaming
+            releaseWakeLock()
+            stopForeground(STOP_FOREGROUND_REMOVE)
             _isStreaming.value = false
             return
         }
+
+        // Update notification with the actual bound port
+        postForegroundNotification(currentPort)
         
         registerNsd(currentPort)
         mjpegServer.onH264ClientConnected = {
@@ -254,6 +243,19 @@ class StreamingService : LifecycleService() {
         mainHandler.postDelayed(screenSaverRunnable, SCREEN_SAVER_DELAY_MS)
     }
 
+    private fun readBatteryStatus(): Pair<Int, Boolean> {
+        val bm = getSystemService(BATTERY_SERVICE) as BatteryManager
+        val level = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+        val charging = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            bm.isCharging
+        } else {
+            val intent = registerReceiver(null, android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))
+            val status = intent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+            status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL
+        }
+        return Pair(level, charging)
+    }
+
     /** Stop all streaming activity; the service stays alive if still bound. */
     fun stopStreaming() {
         if (!_isStreaming.value) return
@@ -265,6 +267,7 @@ class StreamingService : LifecycleService() {
         h264Encoder = null
         mjpegServer.onAllClientsDisconnected = null  // prevent stale callbacks
         mjpegServer.onH264ClientConnected    = null
+        mjpegServer.statusProvider           = null
         mjpegServer.batteryProvider          = null
         mjpegServer.stop()
         releaseWakeLock()
@@ -340,7 +343,7 @@ class StreamingService : LifecycleService() {
         _exposureIndex.value = index
     }
 
-    @ExperimentalCamera2Interop
+    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
     fun setWhiteBalance(modeName: String) {
         _wbMode.value = modeName
         val awbMode = when (modeName) {
@@ -581,7 +584,7 @@ class StreamingService : LifecycleService() {
 
     // ── Foreground notification ───────────────────────────────────────────────
 
-    private fun postForegroundNotification() {
+    private fun postForegroundNotification(activePort: Int = DEFAULT_PORT) {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             nm.createNotificationChannel(
@@ -603,7 +606,7 @@ class StreamingService : LifecycleService() {
 
         val notification: Notification = NotificationCompat.Builder(this, NOTIF_CHANNEL_ID)
             .setContentTitle("PristineCam — Streaming")
-            .setContentText("Serving camera on port $DEFAULT_PORT")
+            .setContentText("Serving camera on port $activePort")
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .setOngoing(true)
             .setContentIntent(openPi)

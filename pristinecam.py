@@ -19,7 +19,7 @@ Architecture:
 
 Usage
 -----
-    python gui_client.py
+    python pristinecam.py
 
 Dependencies
 ------------
@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -39,9 +40,14 @@ from collections import deque
 from pathlib import Path
 from typing import Optional
 
-if typing.TYPE_CHECKING:
+try:
     import cv2
     import numpy as np
+except ImportError:
+    print("ERROR: OpenCV or NumPy not installed.\n  pip install opencv-python numpy")
+    sys.exit(1)
+
+if typing.TYPE_CHECKING:
     import pyvirtualcam
     from pyvirtualcam import PixelFormat
 
@@ -74,6 +80,7 @@ except ImportError:
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
+__version__        = "1.2"
 TARGET_FPS         = 30
 FRAME_INTERVAL     = 1.0 / TARGET_FPS          # ~33.33 ms
 PREVIEW_FPS        = 30
@@ -87,6 +94,16 @@ FPS_WINDOW_SIZE     = 60         # frames for moving average
 LATENCY_GOOD_MS     = 80
 LATENCY_WARN_MS     = 250
 BATTERY_TIMER       = 30000      # ms
+
+DEBUG_MODE: bool = any(
+    arg.upper() in ("--DEBUG=ON", "--DEBUG", "-D") or arg.lower() in ("--debug=on", "--debug")
+    for arg in sys.argv
+)
+
+def debug_log(msg: str) -> None:
+    if DEBUG_MODE:
+        ts = time.strftime("%H:%M:%S")
+        print(f"[{ts}] [DEBUG] {msg}", flush=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration & Paths
@@ -122,7 +139,7 @@ _DEFAULTS: dict = {
     "show_stats": False,
     "show_ipv6": False,
     "stream_codec": "h264",
-    "target_fps": 30,
+    "target_fps": 0,
 }
 
 def _load_cfg() -> dict:
@@ -227,16 +244,19 @@ class StreamWorker(QObject):
     latency_updated    = pyqtSignal(float)
     resolution_updated = pyqtSignal(int, int)
     status_changed     = pyqtSignal(str)
+    status_message     = pyqtSignal(str)
     error_occurred     = pyqtSignal(str)
     battery_updated    = pyqtSignal(int, bool)  # (level 0-100, is_charging)
+    fps_negotiated     = pyqtSignal(int)        # Auto-negotiated framerate (e.g. 30 or 60)
 
-    def __init__(self, url: str, backend: Optional[str], target_fps: int = 30) -> None:
+    def __init__(self, url: str, backend: Optional[str], target_fps: int = 0) -> None:
         super().__init__()
         self._url     = url
         self._backend = backend
         self._running = False
-        self.target_fps = target_fps
-        self.frame_interval = 1.0 / max(1, target_fps)
+        self._auto_fps = (target_fps <= 0)
+        self.target_fps = 30 if target_fps <= 0 else target_fps
+        self.frame_interval = 1.0 / max(1, self.target_fps)
 
         # Shared capture → consumer state (GIL-atomic reference swaps)
         self._latest_frame: Optional[np.ndarray] = None
@@ -255,6 +275,18 @@ class StreamWorker(QObject):
         self._backend: Optional[str] = backend
         self._force_vcam_recreate: bool = False
 
+    @pyqtSlot(int)
+    def update_target_fps(self, fps: int) -> None:
+        """Dynamically update target FPS when auto-negotiated from phone or stream."""
+        if not self._auto_fps:
+            return  # user explicitly forced FPS, do not override
+        if fps in (15, 24, 25, 30, 50, 60, 120) and fps != self.target_fps:
+            debug_log(f"Auto-negotiating target FPS: {self.target_fps} -> {fps} FPS")
+            self.target_fps = fps
+            self.frame_interval = 1.0 / max(1, fps)
+            self._force_vcam_recreate = True
+            self.fps_negotiated.emit(fps)
+
     def set_backend(self, backend: Optional[str]) -> None:
         if self._backend != backend:
             self._backend = backend
@@ -264,61 +296,139 @@ class StreamWorker(QObject):
         self._running = False
         self._frame_event.set()  # unblock consumer if waiting
 
+    def _probe_http_stream(self, url: str) -> str:
+        """Perform a direct HTTP probe to diagnose why VideoCapture failed to open."""
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": f"PristineCam-Diagnostics/{__version__}"}
+            )
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                code = resp.getcode()
+                ct = resp.headers.get("Content-Type", "unknown")
+                chunk = resp.read(1024)
+                if len(chunk) == 0:
+                    return f"HTTP {code} ({ct}), but server sent 0 bytes (empty/stalled)"
+                has_sync = chunk[0] == 0x47 if len(chunk) > 0 else False
+                hex_preview = chunk[:16].hex()
+                return (
+                    f"HTTP {code} ({ct}), received {len(chunk)} bytes "
+                    f"({'valid TS sync 0x47' if has_sync else f'sync=0x{chunk[0]:02x}'}), hex: {hex_preview}"
+                )
+        except urllib.error.HTTPError as exc:
+            return f"HTTP Error {exc.code}: {exc.reason}"
+        except urllib.error.URLError as exc:
+            return f"Network Error: {exc.reason}"
+        except TimeoutError:
+            return "Connection timed out (no response in 3s)"
+        except Exception as exc:
+            return f"Probe error: {exc}"
+
     # ── Capture thread ────────────────────────────────────────────────────
 
     def _capture_loop(self) -> None:
-        import cv2
-        import numpy as np
-
         reconnect_delay = 1.0
         cap = None
         empty_streak = 0
+        is_ts = "live.ts" in self._url
+        frame_idx = 0
+
+        debug_log(f"Capture loop started for {self._url} (is_ts={is_ts})")
+
+        # MPEG-TS over HTTP: tell FFmpeg's libavformat to probe as little data
+        # as possible before starting decode.
+        # cv2.VideoCapture reads OPENCV_FFMPEG_CAPTURE_OPTIONS on open().
+        if is_ts:
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+                "probesize;65536|analyzeduration;500000|fflags;nobuffer|flags;low_delay"
+            )
 
         while self._running:
             if cap is None:
+                debug_log(f"Attempting connection to {self._url}...")
                 self.status_changed.emit("connecting")
+                self.status_message.emit("Connecting to stream...")
+
+                t_open_start = time.perf_counter()
                 cap = cv2.VideoCapture(self._url, cv2.CAP_FFMPEG)
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                if "video_feed" in self._url:
+                if not is_ts:
                     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-                
-                if not cap.isOpened():
+
+                t_open_elapsed = time.perf_counter() - t_open_start
+                is_open = cap.isOpened()
+                debug_log(f"cv2.VideoCapture.isOpened() = {is_open} (took {t_open_elapsed:.3f}s)")
+
+                if not is_open:
                     cap.release()
                     cap = None
+                    probe_report = self._probe_http_stream(self._url)
+                    debug_log(f"Stream diagnostic probe: {probe_report}")
                     if self._running:
                         self.status_changed.emit("error")
+                        self.status_message.emit(f"Failed: {probe_report}")
                         time.sleep(reconnect_delay)
                         reconnect_delay = min(reconnect_delay * 2, 16.0)
                     continue
-                    
+
+                debug_log(f"Stream opened successfully! Probing initial frame...")
                 self.status_changed.emit("connected")
+                self.status_message.emit("Connected, reading stream...")
                 reconnect_delay = 1.0
                 empty_streak = 0
-                
+                frame_idx = 0
+
             t0 = time.perf_counter()
             ok, frame = cap.read()
             t1 = time.perf_counter()
-            
+
             if not ok or frame is None:
                 empty_streak += 1
-                if empty_streak > 30:  # ~1-2 seconds of dead stream
+                threshold = 90 if is_ts else 30
+                if empty_streak == 1 or empty_streak % 15 == 0:
+                    debug_log(f"cap.read() returned ok={ok}, frame={frame is not None} (empty streak: {empty_streak}/{threshold})")
+                    self.status_message.emit(f"Waiting for frames ({empty_streak}/{threshold})...")
+                if empty_streak > threshold:
+                    debug_log(f"Empty streak exceeded {threshold}, dropping capture and reconnecting.")
+                    self.status_message.emit("Stream stalled (no frames received). Reconnecting...")
                     cap.release()
                     cap = None
+                else:
+                    time.sleep(0.02)
                 continue
-                
+
+            frame_idx += 1
+            if frame_idx == 1:
+                debug_log(f"First frame received! Resolution: {frame.shape[1]}x{frame.shape[0]}")
+                self.status_message.emit(f"Streaming ({frame.shape[1]}x{frame.shape[0]})")
+                if self._auto_fps and cap is not None:
+                    try:
+                        c_fps = cap.get(cv2.CAP_PROP_FPS)
+                        if c_fps and 15 <= c_fps <= 120:
+                            int_fps = int(round(c_fps))
+                            if int_fps in (24, 25, 30, 50, 60):
+                                self.update_target_fps(int_fps)
+                    except Exception:
+                        pass
+            elif frame_idx % 150 == 0:
+                debug_log(f"Streaming active: frame #{frame_idx}, capture_latency={(t1 - t0)*1000:.1f}ms")
+
             empty_streak = 0
             self._latest_frame = frame
             self._capture_latency = (t1 - t0) * 1000.0
             self._frame_event.set()  # wake the consumer
-            
+
         if cap is not None:
             cap.release()
+
+        # Clean up the env var so it doesn't leak into unrelated captures
+        if is_ts:
+            os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
 
     # ── Consumer loop (QThread) ───────────────────────────────────────────
 
     @pyqtSlot()
     def run(self) -> None:
-        import cv2
         if HAS_VCAM:
             import pyvirtualcam
             from pyvirtualcam import PixelFormat
@@ -451,8 +561,6 @@ class StreamWorker(QObject):
     # ── Transform helper ──────────────────────────────────────────────────
 
     def _apply_transforms(self, frame: np.ndarray) -> np.ndarray:
-        import numpy as np
-
         if self.mirror_h:
             frame = frame[:, ::-1, :]
         if self.mirror_v:
@@ -509,10 +617,7 @@ class PreviewWidget(QWidget):
 
     def paintEvent(self, _):  # type: ignore[override]
         p = QPainter(self)
-        p.setRenderHints(
-            QPainter.RenderHint.Antialiasing |
-            QPainter.RenderHint.SmoothPixmapTransform,
-        )
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         p.fillRect(self.rect(), QColor("#0c0d10"))
 
         if self._px and not self._px.isNull():
@@ -647,8 +752,8 @@ class SettingsDialog(QDialog):
 
         # Target Framerate
         self.target_fps_cb = QComboBox()
-        self.target_fps_cb.addItems(["30 FPS (Standard)", "60 FPS (Experimental)"])
-        self.target_fps_cb.setToolTip("Stream and virtual camera framerate. 60 FPS requires good lighting and fast Wi-Fi/USB.")
+        self.target_fps_cb.addItems(["Auto (Match phone stream)", "30 FPS (Force)", "60 FPS (Force)"])
+        self.target_fps_cb.setToolTip("Stream and virtual camera framerate. 'Auto' dynamically synchronizes with the phone.")
         form.addRow("Target FPS:", self.target_fps_cb)
 
         # Show Stats
@@ -679,8 +784,13 @@ class SettingsDialog(QDialog):
         self.backend_cb.setCurrentIndex(cfg.get("backend_idx", 0))
         codec = cfg.get("stream_codec", "h264")
         self.codec_cb.setCurrentIndex(0 if codec == "h264" else 1)
-        target_fps = cfg.get("target_fps", 30)
-        self.target_fps_cb.setCurrentIndex(1 if target_fps == 60 else 0)
+        target_fps = cfg.get("target_fps", 0)
+        if target_fps == 60:
+            self.target_fps_cb.setCurrentIndex(2)
+        elif target_fps == 30:
+            self.target_fps_cb.setCurrentIndex(1)
+        else:
+            self.target_fps_cb.setCurrentIndex(0)
         self.stats_chk.setChecked(cfg.get("show_stats", False))
         self.ipv6_chk.setChecked(cfg.get("show_ipv6", False))
 
@@ -693,7 +803,8 @@ class SettingsDialog(QDialog):
 
         self.cfg["backend_idx"] = self.backend_cb.currentIndex()
         self.cfg["stream_codec"] = "h264" if self.codec_cb.currentIndex() == 0 else "mjpeg"
-        self.cfg["target_fps"] = 60 if self.target_fps_cb.currentIndex() == 1 else 30
+        fps_choice = self.target_fps_cb.currentIndex()
+        self.cfg["target_fps"] = 0 if fps_choice == 0 else (30 if fps_choice == 1 else 60)
         self.cfg["show_stats"] = self.stats_chk.isChecked()
         self.cfg["show_ipv6"] = self.ipv6_chk.isChecked()
         super().accept()
@@ -735,7 +846,10 @@ class MainWindow(QMainWindow):
     # ── UI construction ──────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
-        self.setWindowTitle("PristineCam")
+        title = f"PristineCam v{__version__}"
+        if DEBUG_MODE:
+            title += "  [DEBUG MODE]"
+        self.setWindowTitle(title)
         self.setMinimumSize(945, 630)
         self.resize(1344, 756)
 
@@ -945,10 +1059,12 @@ class MainWindow(QMainWindow):
                     data = json.loads(resp.read())
                 level    = int(data.get("battery", -1))
                 charging = bool(data.get("charging", False))
+                phone_fps = int(data.get("fps", 0))
                 if worker is self._worker:   # still the same session
                     worker.battery_updated.emit(level, charging)
-            except Exception as exc:
-                print(f"Connection failed: {exc}")
+                    if phone_fps > 0:
+                        worker.update_target_fps(phone_fps)
+            except Exception:
                 pass  # silently ignore network errors during poll
 
         threading.Thread(target=_fetch, daemon=True, name="pristinecam-battery").start()
@@ -1153,8 +1269,10 @@ class MainWindow(QMainWindow):
         self._worker.latency_updated.connect(self._on_latency)
         self._worker.resolution_updated.connect(self._on_resolution)
         self._worker.status_changed.connect(self._on_status)
+        self._worker.status_message.connect(self._on_status_message)
         self._worker.error_occurred.connect(self._on_error)
         self._worker.battery_updated.connect(self._on_battery_updated)
+        self._worker.fps_negotiated.connect(self._on_fps_negotiated)
 
         # Derive /status URL from the stream URL
         self._status_url = self._stream_url().replace("/live.ts", "/status").replace("/video_feed", "/status")
@@ -1162,6 +1280,7 @@ class MainWindow(QMainWindow):
         self._thread.start()
         self._connected = True
         self._set_ui_connected(True)
+        QTimer.singleShot(300, self._poll_battery)
 
     def _do_disconnect(self) -> None:
         self._connected = False
@@ -1208,8 +1327,16 @@ class MainWindow(QMainWindow):
             self._do_disconnect()
 
     @pyqtSlot(str)
+    def _on_status_message(self, msg: str) -> None:
+        self.statusBar().showMessage(msg, 6000)
+
+    @pyqtSlot(str)
     def _on_error(self, msg: str) -> None:
         self.statusBar().showMessage(f"⚠  {msg}", 6000)
+
+    @pyqtSlot(int)
+    def _on_fps_negotiated(self, fps: int) -> None:
+        self.statusBar().showMessage(f"Stream framerate auto-negotiated: {fps} FPS", 4000)
 
     # ── Real-time control slots ───────────────────────────────────────────
 
@@ -1448,7 +1575,7 @@ QStatusBar::item { border: none; }
 def run_self_tests() -> int:
     """Headless self-test suite for CI/buildall verification."""
     print("=" * 60)
-    print("PristineCam Desktop Client — Self-Test Suite")
+    print(f"PristineCam Desktop Client v{__version__} — Self-Test Suite")
     print("=" * 60)
     failed = 0
 
@@ -1458,6 +1585,7 @@ def run_self_tests() -> int:
         import cv2
         import numpy as np
         from PyQt6 import QtCore, QtWidgets, QtGui
+        print(f"  [OK] PristineCam: v{__version__}")
         print(f"  [OK] OpenCV: {cv2.__version__}")
         print(f"  [OK] NumPy: {np.__version__}")
         print(f"  [OK] PyQt6: {QtCore.PYQT_VERSION_STR}")
@@ -1474,7 +1602,7 @@ def run_self_tests() -> int:
         assert "target_fps" in cfg, "Missing target_fps key"
         assert "show_ipv6" in cfg, "Missing show_ipv6 key"
         assert cfg["stream_codec"] in ("h264", "mjpeg"), f"Invalid default stream_codec: {cfg['stream_codec']}"
-        assert cfg["target_fps"] in (30, 60), f"Invalid default target_fps: {cfg['target_fps']}"
+        assert cfg["target_fps"] in (0, 30, 60), f"Invalid default target_fps: {cfg['target_fps']}"
         print(f"  [OK] Config keys valid (codec={cfg['stream_codec']}, fps={cfg['target_fps']})")
     except Exception as exc:
         print(f"  [FAIL] Config check FAILED: {exc}")
@@ -1529,10 +1657,15 @@ def run_self_tests() -> int:
         assert out_90.shape == (w, h, 3), f"Rotation 90 shape mismatch: {out_90.shape}"
         assert out_90.flags.c_contiguous, "Memory not C-contiguous after 90 deg rotation"
 
-        # Test 60 FPS pacing interval calculation
+        # Test 60 FPS pacing interval calculation and dynamic auto-negotiation
         worker_60 = StreamWorker("http://127.0.0.1:8080/live.ts", None, target_fps=60)
         assert abs(worker_60.frame_interval - (1.0 / 60)) < 1e-6, "60 FPS frame interval incorrect"
-        print("  [OK] Zero-copy transforms and 60 FPS pacing calculations verified")
+        worker_auto = StreamWorker("http://127.0.0.1:8080/live.ts", None, target_fps=0)
+        assert worker_auto._auto_fps, "StreamWorker should be in auto_fps mode"
+        worker_auto.update_target_fps(60)
+        assert abs(worker_auto.frame_interval - (1.0 / 60)) < 1e-6, "Auto-negotiated 60 FPS frame interval incorrect"
+        assert worker_auto.target_fps == 60, "Auto-negotiated target_fps not updated"
+        print("  [OK] Zero-copy transforms and 60 FPS pacing/auto-negotiation verified")
     except Exception as exc:
         print(f"  [FAIL] Transformation test FAILED: {exc}")
         failed += 1
@@ -1564,6 +1697,12 @@ def run_self_tests() -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    if DEBUG_MODE:
+        print("=" * 60)
+        print(f"  PristineCam v{__version__} Debug Logging: ACTIVE (--DEBUG=ON)")
+        print(f"  Python: {sys.version.split()[0]} | OpenCV: {cv2.__version__}")
+        print("=" * 60, flush=True)
+
     app = QApplication(sys.argv)
     app.setApplicationName("PristineCam")
     app.setOrganizationName("PristineCam")
@@ -1577,6 +1716,13 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print("Usage: python pristinecam.py [OPTIONS]")
+        print("Options:")
+        print("  --debug, --DEBUG=ON    Enable verbose stream diagnostic logging")
+        print("  --self-test            Run internal verification tests and exit")
+        print("  -h, --help             Show this help message and exit")
+        sys.exit(0)
     if "--self-test" in sys.argv:
         sys.exit(run_self_tests())
     main()

@@ -4,6 +4,9 @@ import fi.iki.elonen.NanoHTTPD
 import java.io.IOException
 import java.io.PipedInputStream
 import java.io.PipedOutputStream
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -34,8 +37,16 @@ class MjpegServer(port: Int) : NanoHTTPD(port) {
     private val latestJpeg   = AtomicReference<ByteArray?>(null)
     private val frameVersion = AtomicLong(0L)
 
-    private val latestH264Ts = AtomicReference<ByteArray?>(null)
-    private val h264Version  = AtomicLong(0L)
+    private val frameLock = Object()
+
+    private class H264Client(
+        val pipedOut: PipedOutputStream
+    ) {
+        val queue = LinkedBlockingQueue<ByteArray>(60)
+        @Volatile var isClosed = false
+    }
+
+    private val h264Clients = CopyOnWriteArrayList<H264Client>()
 
     /** Number of clients currently receiving the stream. */
     val activeClients = AtomicInteger(0)
@@ -52,9 +63,23 @@ class MjpegServer(port: Int) : NanoHTTPD(port) {
      */
     var onH264ClientConnected: (() -> Unit)? = null
 
+    data class StreamStatus(
+        val battery: Int,
+        val charging: Boolean,
+        val fps: Int,
+        val width: Int,
+        val height: Int,
+        val codec: String
+    )
+
     /**
-     * Called on each GET /status request to read the current battery level
-     * (0–100) and charging state. Set by StreamingService after construction.
+     * Called on each GET /status request to read the current device/stream status.
+     * Set by StreamingService after construction.
+     */
+    var statusProvider: (() -> StreamStatus)? = null
+
+    /**
+     * Legacy callback for battery status.
      */
     var batteryProvider: (() -> Pair<Int, Boolean>)? = null
 
@@ -62,16 +87,23 @@ class MjpegServer(port: Int) : NanoHTTPD(port) {
     @Volatile
     private var graceTimer: Thread? = null
 
-    /** Replace the current frame; all connected clients will send it on their next poll. */
+    /** Replace the current frame; all connected clients will send it immediately. */
     fun pushFrame(jpeg: ByteArray) {
         latestJpeg.set(jpeg)
         frameVersion.incrementAndGet()
+        synchronized(frameLock) {
+            frameLock.notifyAll()
+        }
     }
 
-    /** Push encoded MPEG-TS chunk to connected /live.ts clients. */
+    /** Push encoded MPEG-TS chunk to connected /live.ts clients immediately. */
     fun pushH264Ts(tsChunk: ByteArray) {
-        latestH264Ts.set(tsChunk)
-        h264Version.incrementAndGet()
+        for (client in h264Clients) {
+            if (!client.queue.offer(tsChunk)) {
+                client.queue.poll()
+                client.queue.offer(tsChunk)
+            }
+        }
     }
 
     // ── Request routing ───────────────────────────────────────────────────────
@@ -89,8 +121,13 @@ class MjpegServer(port: Int) : NanoHTTPD(port) {
     }
 
     private fun serveStatus(): Response {
-        val (level, charging) = batteryProvider?.invoke() ?: Pair(-1, false)
-        val json = """{"battery":$level,"charging":$charging}"""
+        val json = if (statusProvider != null) {
+            val s = statusProvider!!.invoke()
+            """{"battery":${s.battery},"charging":${s.charging},"fps":${s.fps},"width":${s.width},"height":${s.height},"codec":"${s.codec}"}"""
+        } else {
+            val (level, charging) = batteryProvider?.invoke() ?: Pair(-1, false)
+            """{"battery":$level,"charging":$charging}"""
+        }
         return newFixedLengthResponse(Response.Status.OK, "application/json", json)
             .also { it.addHeader("Cache-Control", "no-cache") }
     }
@@ -115,24 +152,20 @@ class MjpegServer(port: Int) : NanoHTTPD(port) {
 
         cancelGraceTimer()
         activeClients.incrementAndGet()
+
+        val client = H264Client(pipedOut)
+        h264Clients.add(client)
+
+        // Request an immediate keyframe so this new client connects instantly
         onH264ClientConnected?.invoke()
 
         Thread({
             try {
-                var lastVersion = -1L
-                while (true) {
-                    val current = h264Version.get()
-                    if (current != lastVersion) {
-                        lastVersion = current
-                        val tsData = latestH264Ts.get() ?: run {
-                            Thread.sleep(POLL_INTERVAL_MS)
-                            return@run null
-                        } ?: continue
-
-                        pipedOut.write(tsData)
+                while (!client.isClosed) {
+                    val chunk = client.queue.poll(500, TimeUnit.MILLISECONDS)
+                    if (chunk != null) {
+                        pipedOut.write(chunk)
                         pipedOut.flush()
-                    } else {
-                        Thread.sleep(POLL_INTERVAL_MS)
                     }
                 }
             } catch (_: IOException) {
@@ -140,6 +173,8 @@ class MjpegServer(port: Int) : NanoHTTPD(port) {
             } catch (_: InterruptedException) {
                 // Service shutdown.
             } finally {
+                client.isClosed = true
+                h264Clients.remove(client)
                 runCatching { pipedOut.close() }
                 onClientDisconnected()
             }
@@ -151,7 +186,6 @@ class MjpegServer(port: Int) : NanoHTTPD(port) {
             pipedIn
         ).also {
             it.addHeader("Cache-Control", "no-cache")
-            it.addHeader("Connection", "close")
         }
     }
 
@@ -174,10 +208,7 @@ class MjpegServer(port: Int) : NanoHTTPD(port) {
                     val current = frameVersion.get()
                     if (current != lastVersion) {
                         lastVersion = current
-                        val jpeg = latestJpeg.get() ?: run {
-                            Thread.sleep(POLL_INTERVAL_MS)
-                            return@run null
-                        } ?: continue
+                        val jpeg = latestJpeg.get() ?: continue
 
                         pipedOut.write(
                             "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${jpeg.size}\r\n\r\n"
@@ -187,7 +218,11 @@ class MjpegServer(port: Int) : NanoHTTPD(port) {
                         pipedOut.write("\r\n".toByteArray(Charsets.US_ASCII))
                         pipedOut.flush()
                     } else {
-                        Thread.sleep(POLL_INTERVAL_MS)
+                        synchronized(frameLock) {
+                            if (frameVersion.get() == lastVersion) {
+                                frameLock.wait(WAIT_TIMEOUT_MS)
+                            }
+                        }
                     }
                 }
             } catch (_: IOException) {
@@ -247,12 +282,17 @@ class MjpegServer(port: Int) : NanoHTTPD(port) {
 
     override fun stop() {
         cancelGraceTimer()
+        for (client in h264Clients) {
+            client.isClosed = true
+        }
+        h264Clients.clear()
+        synchronized(frameLock) { frameLock.notifyAll() }
         super.stop()
     }
 
     companion object {
         private const val PIPE_BUFFER_BYTES     = 512 * 1024 // 512 KB per client connection
-        private const val POLL_INTERVAL_MS      = 5L
+        private const val WAIT_TIMEOUT_MS       = 100L       // Fallback wait timeout
         /** Seconds to wait after the last client disconnects before auto-stopping. */
         private const val DISCONNECT_GRACE_MS   = 5_000L     // 5 seconds
     }

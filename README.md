@@ -8,7 +8,10 @@ PristineCam is a private, open-source, ad-free desktop virtual camera powered by
 ## Features
 
 - **Strictly Local & Private:** Zero analytics, zero tracking, no cloud telemetry, no internet required. All traffic stays on your local network or USB cable.
+- **Hardware H.264 & MJPEG Streaming:** High-performance hardware-accelerated H.264 compression via MPEG-TS for crystal-clear quality and reduced bandwidth, with legacy MJPEG fallback.
+- **Dynamic Auto-FPS Negotiation:** Automatically synchronizes PC virtual webcam pacing with the phone camera's active framerate (30 / 60 FPS).
 - **Auto-Discovery (mDNS):** The PC client automatically finds your phone on the Wi-Fi network—no manual IP typing required!
+- **Battery & Device Telemetry:** Real-time battery percentage and charging status displayed directly in the desktop interface.
 - **OLED Battery Saver:** The Android app automatically darkens the screen after 1 minute of streaming to save battery and prevent screen burn-in.
 - **Background Streaming:** The Android app runs as a foreground service, so the camera stream continues even if you switch apps.
 - **Low Latency USB Mode:** Connect via USB and ADB port-forwarding for a direct, low-latency stream without relying on Wi-Fi stability.
@@ -59,8 +62,8 @@ If you prefer to compile PristineCam yourself:
 ### PC Client
 1. Install [Python 3.8+](https://www.python.org/downloads/).
 2. Clone the repo and install dependencies: `pip install -r requirements.txt`
-3. Run from source: `python gui_client.py` (or headless: `python pc_client.py --ip YOUR_PHONE_IP --port 8080`)
-4. **Build the `.exe`:** Run `.\buildexe.py` (requires Pyinstaller).
+3. Run from source: `python pristinecam.py`
+4. **Build from source:** Run `python buildexe.py` (for PC executable) or `python release/buildall.py` (for unified Android + PC build).
 
 ### Android App
 1. Open the `android/` folder in **Android Studio**.

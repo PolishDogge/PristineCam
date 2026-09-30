@@ -44,7 +44,7 @@ def get_python_executable():
 
 def main():
     print("========================================")
-    print("  PristineCam - Unified Build Script")
+    print("  PristineCam v1.2 - Unified Build Script")
     print("========================================")
     
     python_bin = get_python_executable()
@@ -75,15 +75,16 @@ def main():
             raise FileNotFoundError(f"Release APK was not found at {release_apk}")
 
         # 3. Pre-Build Self-Tests (Guarantees PC client is working before PyInstaller packaging)
-        run_command([python_bin, 'changed_gui.py', '--self-test'], cwd=root_dir)
+        run_command([python_bin, 'pristinecam.py', '--self-test'], cwd=root_dir)
 
         # 4. Build PC Executable (ensure any running instances are closed so dist file is not locked)
         if sys.platform == 'win32':
+            subprocess.run(['taskkill', '/f', '/im', 'PristineCam.exe'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run(['taskkill', '/f', '/im', 'changed_gui.exe'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         run_command([python_bin, 'buildexe.py'], cwd=root_dir)
         
         # 5. Move PC Executable to output directory
-        exe_source = os.path.join(root_dir, 'dist', 'changed_gui.exe')
+        exe_source = os.path.join(root_dir, 'dist', 'PristineCam.exe')
         exe_dest = os.path.join(out_dir, 'PristineCam.exe')
         
         if not os.path.exists(exe_source):

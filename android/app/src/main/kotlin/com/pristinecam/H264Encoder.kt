@@ -6,8 +6,7 @@ import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Build
 import android.os.Bundle
-import java.io.ByteArrayOutputStream
-import java.nio.ByteBuffer
+import android.util.Log
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -36,58 +35,66 @@ class H264Encoder(
     }
 
     private fun setupCodec() {
-        try {
-            colorFormat = selectColorFormat()
+        val candidates: List<() -> MediaCodec> = listOf(
+            { MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC) },
+            { MediaCodec.createByCodecName("c2.android.avc.encoder") },
+            { MediaCodec.createByCodecName("OMX.google.h264.encoder") }
+        )
 
-            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
-                setInteger(MediaFormat.KEY_COLOR_FORMAT, colorFormat)
-                setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
-                setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 0) // ALL-INTRA: every frame is a keyframe!
-                setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
-                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    setInteger(MediaFormat.KEY_LATENCY, 0)
-                }
-            }
-
-            val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        for (candidate in candidates) {
+            var encoder: MediaCodec? = null
             try {
+                encoder = candidate()
+                val codecInfo = encoder.codecInfo
+                val caps = codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                colorFormat = selectSupportedColorFormat(caps)
+
+                val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+                    setInteger(MediaFormat.KEY_COLOR_FORMAT, colorFormat)
+                    setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+                    setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+                    setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+
+                    val encCaps = caps.encoderCapabilities
+                    if (encCaps != null && encCaps.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)) {
+                        setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+                    } else if (encCaps != null && encCaps.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)) {
+                        setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+                    }
+                }
+
                 encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                encoder.start()
+
+                codec = encoder
+                isRunning.set(true)
+                Log.i(TAG, "Initialized H.264 encoder: ${codecInfo.name} (${width}x${height} @ ${fps}fps, colorFormat=$colorFormat)")
+
+                drainThread = Thread({ drainLoop() }, "pristinecam-h264-drain").also {
+                    it.isDaemon = true
+                    it.start()
+                }
+                return
             } catch (e: Exception) {
-                // Fallback for hardware encoders that reject I_FRAME_INTERVAL = 0
-                format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-                encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                Log.w(TAG, "Codec initialization attempt failed: ${e.message}", e)
+                try {
+                    encoder?.release()
+                } catch (_: Exception) {}
             }
-            encoder.start()
-
-            codec = encoder
-            isRunning.set(true)
-
-            // Background drain thread to read encoded NAL units without blocking camera analysis
-            drainThread = Thread({ drainLoop() }, "pristinecam-h264-drain").also {
-                it.isDaemon = true
-                it.start()
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-            release()
         }
+
+        Log.e(TAG, "All H.264 encoder initialization attempts failed!")
     }
 
     companion object {
+        private const val TAG = "H264Encoder"
         // Standard color format constants used by Android hardware & software encoders
         private const val COLOR_FORMAT_NV12 = 21
         private const val COLOR_FORMAT_I420 = 19
     }
 
-    private fun selectColorFormat(): Int {
-        val codecInfo = selectEncoderInfo(MediaFormat.MIMETYPE_VIDEO_AVC)
-            ?: return MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
-        val capabilities = codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+    private fun selectSupportedColorFormat(capabilities: MediaCodecInfo.CodecCapabilities): Int {
         val formats = capabilities.colorFormats
-
-        // Prefer NV12 (21), then I420 (19), then Flexible
         for (f in formats) {
             if (f == COLOR_FORMAT_NV12) return f
         }
@@ -98,18 +105,6 @@ class H264Encoder(
             if (f == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible) return f
         }
         return formats.firstOrNull() ?: MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
-    }
-
-    private fun selectEncoderInfo(mimeType: String): MediaCodecInfo? {
-        val list = MediaCodecList(MediaCodecList.REGULAR_CODECS)
-        for (info in list.codecInfos) {
-            if (!info.isEncoder) continue
-            val types = info.supportedTypes
-            for (t in types) {
-                if (t.equals(mimeType, ignoreCase = true)) return info
-            }
-        }
-        return null
     }
 
     /**
@@ -137,13 +132,13 @@ class H264Encoder(
                     nv21ToI420(nv21, reusableNv12, width, height)
                     inBuffer.put(reusableNv12, 0, totalSize)
                 } else {
-                    inBuffer.put(nv21, 0, Math.min(nv21.size, inBuffer.remaining()))
+                    inBuffer.put(nv21, 0, minOf(nv21.size, inBuffer.remaining()))
                 }
 
                 encoder.queueInputBuffer(inIndex, 0, totalSize, ptsUs, 0)
             }
         } catch (e: Exception) {
-            e.printStackTrace()
+            Log.e(TAG, "Error encoding frame", e)
         }
     }
 
@@ -207,7 +202,18 @@ class H264Encoder(
         while (isRunning.get()) {
             try {
                 val outIndex = encoder.dequeueOutputBuffer(bufferInfo, 10_000L) // 10 ms
-                if (outIndex >= 0) {
+                if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    try {
+                        val newFormat = encoder.outputFormat
+                        val sps = newFormat.getByteBuffer("csd-0")
+                        val pps = newFormat.getByteBuffer("csd-1")
+                        if (sps != null && pps != null) {
+                            val spsBytes = ByteArray(sps.remaining()).also { sps.get(it); sps.rewind() }
+                            val ppsBytes = ByteArray(pps.remaining()).also { pps.get(it); pps.rewind() }
+                            spsPpsHeader = spsBytes + ppsBytes
+                        }
+                    } catch (_: Exception) {}
+                } else if (outIndex >= 0) {
                     val outBuffer = encoder.getOutputBuffer(outIndex)
                     if (outBuffer != null && bufferInfo.size > 0) {
                         outBuffer.position(bufferInfo.offset)
@@ -235,7 +241,7 @@ class H264Encoder(
                 }
             } catch (e: Exception) {
                 if (isRunning.get()) {
-                    e.printStackTrace()
+                    Log.e(TAG, "Error in drain loop", e)
                 }
                 break
             }
@@ -243,14 +249,24 @@ class H264Encoder(
     }
 
     private fun containsSps(data: ByteArray): Boolean {
-        val offset = if (data.size >= 5 && data[0] == 0.toByte() && data[1] == 0.toByte() && data[2] == 0.toByte() && data[3] == 1.toByte()) {
-            4
-        } else if (data.size >= 4 && data[0] == 0.toByte() && data[1] == 0.toByte() && data[2] == 1.toByte()) {
-            3
-        } else {
-            return false
+        var i = 0
+        while (i < data.size - 4) {
+            if (data[i] == 0.toByte() && data[i + 1] == 0.toByte()) {
+                val nalStart = if (data[i + 2] == 1.toByte()) {
+                    i + 3
+                } else if (data[i + 2] == 0.toByte() && i + 3 < data.size && data[i + 3] == 1.toByte()) {
+                    i + 4
+                } else {
+                    -1
+                }
+                if (nalStart != -1 && nalStart < data.size) {
+                    val nalType = data[nalStart].toInt() and 0x1F
+                    if (nalType == 7) return true
+                }
+            }
+            i++
         }
-        return offset < data.size && (data[offset].toInt() and 0x1F) == 7
+        return false
     }
 
     fun release() {
